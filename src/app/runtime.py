@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 import os
+import ipaddress
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -101,6 +102,7 @@ class AppRuntime:
         self._offline_feature_buffer: list[dict] = []
         self._offline_feature_flush_size = 8000
         self._offline_detection_batch_counter = 0
+        self._bootstrap_firewall_blacklist_sync()
 
     @staticmethod
     def _normalize_offline_mode(mode: str) -> str:
@@ -1160,27 +1162,186 @@ class AppRuntime:
             },
         }
 
-    def block_ip_with_firewall(self, ip: str, operator: str) -> tuple[bool, str]:
-        target = (ip or "").strip()
-        if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
-            return False, "IP格式无效"
-        rule_base = f"AI_Traffic_Guard_Block_{target}"
+    @staticmethod
+    def _is_valid_ipv4(ip: str) -> bool:
+        try:
+            parsed = ipaddress.ip_address(str(ip or "").strip())
+        except ValueError:
+            return False
+        return parsed.version == 4
+
+    @staticmethod
+    def _firewall_rule_base(ip: str) -> str:
+        return f"AI_Traffic_Guard_Block_{ip}"
+
+    @staticmethod
+    def _run_netsh(args: list[str]) -> tuple[bool, str]:
+        res = subprocess.run(["netsh", *args], capture_output=True, text=True, check=False)
+        output = (res.stderr or res.stdout or "").strip()
+        return res.returncode == 0, output
+
+    def _ensure_firewall_block_rules(self, ip: str) -> tuple[bool, str]:
+        base = self._firewall_rule_base(ip)
         cmds = [
-            ["netsh", "advfirewall", "firewall", "add", "rule", f'name="{rule_base}_OUT"', "dir=out", "action=block", f"remoteip={target}"],
-            ["netsh", "advfirewall", "firewall", "add", "rule", f'name="{rule_base}_IN"', "dir=in", "action=block", f"remoteip={target}"],
+            ["advfirewall", "firewall", "add", "rule", f'name="{base}_OUT"', "dir=out", "action=block", f"remoteip={ip}"],
+            ["advfirewall", "firewall", "add", "rule", f'name="{base}_IN"', "dir=in", "action=block", f"remoteip={ip}"],
         ]
         for cmd in cmds:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if res.returncode != 0:
-                msg = (res.stderr or res.stdout or "").strip() or "防火墙规则写入失败，请以管理员权限运行"
+            ok, msg = self._run_netsh(cmd)
+            if not ok:
+                return False, msg or "防火墙规则写入失败，请以管理员权限运行"
+        return True, ""
+
+    def _remove_firewall_block_rules(self, ip: str) -> tuple[bool, str]:
+        base = self._firewall_rule_base(ip)
+        cmds = [
+            ["advfirewall", "firewall", "delete", "rule", f'name="{base}_OUT"'],
+            ["advfirewall", "firewall", "delete", "rule", f'name="{base}_IN"'],
+        ]
+        errors: list[str] = []
+        for cmd in cmds:
+            ok, msg = self._run_netsh(cmd)
+            if ok:
+                continue
+            low = msg.lower()
+            # 规则已不存在时视为幂等成功。
+            if "no rules match" in low or "没有与指定标准匹配的规则" in low:
+                continue
+            errors.append(msg or "防火墙规则删除失败")
+        if errors:
+            return False, " | ".join(errors)
+        return True, ""
+
+    def _load_enabled_blacklist_ips(self) -> set[str]:
+        c = self.db.conn.cursor()
+        c.execute("SELECT DISTINCT ip FROM blacklist_whitelist WHERE list_type='black' AND enabled=1")
+        ips: set[str] = set()
+        for row in c.fetchall():
+            ip = str(row["ip"] or "").strip()
+            if self._is_valid_ipv4(ip):
+                ips.add(ip)
+        return ips
+
+    def _load_managed_firewall_blocked_ips(self) -> set[str]:
+        ok, output = self._run_netsh(["advfirewall", "firewall", "show", "rule", "name=all"])
+        if not ok:
+            return set()
+        found = re.findall(r"AI_Traffic_Guard_Block_(\d{1,3}(?:\.\d{1,3}){3})_(?:IN|OUT)", output or "")
+        return {ip for ip in found if self._is_valid_ipv4(ip)}
+
+    def _bootstrap_firewall_blacklist_sync(self) -> None:
+        db_ips = self._load_enabled_blacklist_ips()
+        fw_ips = self._load_managed_firewall_blocked_ips()
+        if fw_ips:
+            for ip in fw_ips - db_ips:
+                self._remove_firewall_block_rules(ip)
+        for ip in db_ips:
+            self._ensure_firewall_block_rules(ip)
+        self.blocked_ips = set(db_ips)
+        self.last_summary["firewall_blocks"] = len(self.blocked_ips)
+
+    def _has_enabled_blacklist_entry(self, ip: str, exclude_item_id: int | None = None) -> bool:
+        target = str(ip or "").strip()
+        if not target:
+            return False
+        c = self.db.conn.cursor()
+        if exclude_item_id is None:
+            c.execute(
+                "SELECT COUNT(1) AS cnt FROM blacklist_whitelist WHERE ip=? AND list_type='black' AND enabled=1",
+                (target,),
+            )
+        else:
+            c.execute(
+                "SELECT COUNT(1) AS cnt FROM blacklist_whitelist WHERE ip=? AND list_type='black' AND enabled=1 AND id<>?",
+                (target, int(exclude_item_id)),
+            )
+        row = c.fetchone()
+        return bool(int(row["cnt"] or 0)) if row else False
+
+    def upsert_blacklist_with_firewall(self, ip: str, enabled: int, remark: str, operator: str) -> tuple[bool, str]:
+        target = (ip or "").strip()
+        if not self._is_valid_ipv4(target):
+            return False, "IP格式无效"
+        is_enabled = int(enabled) == 1
+        if is_enabled:
+            ok, msg = self._ensure_firewall_block_rules(target)
+            if not ok:
                 return False, msg
+            self.blocked_ips.add(target)
+        else:
+            ok, msg = self._remove_firewall_block_rules(target)
+            if not ok:
+                return False, msg
+            self.blocked_ips.discard(target)
+        self.list_service.upsert(target, "black", 1 if is_enabled else 0, remark)
+        self.last_summary["firewall_blocks"] = len(self.blocked_ips)
+        self.audit.log(operator, "blacklist_firewall_sync", target, f"enabled={1 if is_enabled else 0}")
+        return True, "同步成功"
+
+    def update_list_item_with_firewall(self, item_id: int, enabled: int, remark: str, operator: str) -> tuple[bool, str]:
+        c = self.db.conn.cursor()
+        c.execute("SELECT ip, list_type, enabled FROM blacklist_whitelist WHERE id=?", (int(item_id),))
+        row = c.fetchone()
+        if not row:
+            return False, "名单项不存在"
+        ip = str(row["ip"] or "").strip()
+        list_type = str(row["list_type"] or "").strip().lower()
+        prev_enabled = 1 if int(row["enabled"] or 0) == 1 else 0
+        target_enabled = 1 if int(enabled) == 1 else 0
+        if list_type == "black" and self._is_valid_ipv4(ip):
+            if target_enabled == 1:
+                ok, msg = self._ensure_firewall_block_rules(ip)
+                if not ok:
+                    return False, msg
+                self.blocked_ips.add(ip)
+            elif prev_enabled == 1 and not self._has_enabled_blacklist_entry(ip, exclude_item_id=int(item_id)):
+                ok, msg = self._remove_firewall_block_rules(ip)
+                if not ok:
+                    return False, msg
+                self.blocked_ips.discard(ip)
+        self.list_service.update_item(int(item_id), target_enabled, remark)
+        if list_type == "black" and self._is_valid_ipv4(ip) and self._has_enabled_blacklist_entry(ip):
+            self.blocked_ips.add(ip)
+        self.last_summary["firewall_blocks"] = len(self.blocked_ips)
+        self.audit.log(operator, "blacklist_firewall_sync", ip or str(item_id), f"enabled={target_enabled}")
+        return True, "同步成功"
+
+    def delete_list_item_with_firewall(self, item_id: int, operator: str) -> tuple[bool, str]:
+        c = self.db.conn.cursor()
+        c.execute("SELECT ip, list_type, enabled FROM blacklist_whitelist WHERE id=?", (int(item_id),))
+        row = c.fetchone()
+        if not row:
+            return False, "名单项不存在"
+        ip = str(row["ip"] or "").strip()
+        list_type = str(row["list_type"] or "").strip().lower()
+        enabled = 1 if int(row["enabled"] or 0) == 1 else 0
+        if list_type == "black" and enabled == 1 and self._is_valid_ipv4(ip) and not self._has_enabled_blacklist_entry(ip, exclude_item_id=int(item_id)):
+            ok, msg = self._remove_firewall_block_rules(ip)
+            if not ok:
+                return False, msg
+            self.blocked_ips.discard(ip)
+        self.list_service.delete(int(item_id))
+        if list_type == "black" and self._is_valid_ipv4(ip) and self._has_enabled_blacklist_entry(ip):
+            self.blocked_ips.add(ip)
+        self.last_summary["firewall_blocks"] = len(self.blocked_ips)
+        self.audit.log(operator, "blacklist_firewall_sync", ip or str(item_id), "enabled=0,delete=1")
+        return True, "同步成功"
+
+    def block_ip_with_firewall(self, ip: str, operator: str) -> tuple[bool, str]:
+        target = (ip or "").strip()
+        if not self._is_valid_ipv4(target):
+            return False, "IP格式无效"
+        ok, msg = self._ensure_firewall_block_rules(target)
+        if not ok:
+            return False, msg or "防火墙规则写入失败，请以管理员权限运行"
         self.blocked_ips.add(target)
         self.list_service.upsert(target, "black", 1, "firewall_auto_block")
         self.audit.log(operator, "firewall_block_ip", target, "desktop_one_click")
         self.last_summary["firewall_blocks"] = len(self.blocked_ips)
         return True, "封禁成功"
 
-    def generate_security_report(self, operator: str) -> Path:
-        path = self.report_service.generate_visual_report()
-        self.audit.log(operator, "report_generate", str(path), "visual_security_report")
+    def generate_security_report(self, operator: str, source: str) -> Path:
+        report_source = "offline" if str(source or "").strip().lower() == "offline" else "live"
+        path = self.report_service.generate_visual_report(source=report_source)
+        self.audit.log(operator, "report_generate", str(path), f"visual_security_report:{report_source}")
         return path

@@ -52,7 +52,6 @@ class DesktopApp:
         self._current_packet_detail: dict | None = None
         self._packet_rows_in_view: list[dict] = []
         self._packet_tree_id_map: dict[str, int] = {}
-        self._nav_collapsed = False
         self._nav_width_expanded = 190
         self.root = tk.Tk()
         self.root.title("网络流量安全监测与分析平台 个人版")
@@ -208,9 +207,6 @@ class DesktopApp:
         top.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(top, text="[APP] AI流量异常检测系统 工作台", style="Top.TLabel").pack(side=tk.LEFT, padx=(0, 12), pady=8)
         ttk.Label(top, text="LOC: C:\\ProgramData\\AI-Traffic\\console", style="Path.TLabel").pack(side=tk.LEFT, pady=8)
-        self.nav_toggle_btn = ttk.Button(top, text="[NAV] 收起侧栏", style="Secondary.TButton", command=self._toggle_nav_panel)
-        self.nav_toggle_btn.pack(side=tk.LEFT, padx=8, pady=4)
-        
         self.top_status_var = tk.StringVar(value="[STATUS: UNAUTH]")
         ttk.Label(top, textvariable=self.top_status_var, style="Top.TLabel").pack(side=tk.RIGHT, padx=12)
         ttk.Button(top, text="[EXIT] 退出登录", style="Danger.TButton", command=self.logout).pack(side=tk.RIGHT, padx=8, pady=4)
@@ -288,31 +284,10 @@ class DesktopApp:
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         self.root.after(80, self._apply_default_layout)
 
-    def _pane_contains(self, pane: tk.PanedWindow, widget: tk.Widget) -> bool:
-        try:
-            return str(widget) in pane.panes()
-        except tk.TclError:
-            return False
-
-    def _toggle_nav_panel(self) -> None:
-        if self._nav_collapsed:
-            if self._pane_contains(self.main_body_pane, self.page_container):
-                self.main_body_pane.forget(self.page_container)
-            self.main_body_pane.add(self.nav_panel, minsize=150, width=self._nav_width_expanded)
-            self.main_body_pane.add(self.page_container, minsize=860)
-            self._nav_collapsed = False
-            self.nav_toggle_btn.configure(text="[NAV] 收起侧栏")
-            self.root.after(20, self._apply_default_layout)
-            return
-        if self._pane_contains(self.main_body_pane, self.nav_panel):
-            self.main_body_pane.forget(self.nav_panel)
-        self._nav_collapsed = True
-        self.nav_toggle_btn.configure(text="[NAV] 展开侧栏")
-
     def _apply_default_layout(self) -> None:
         self.root.update_idletasks()
         try:
-            if len(self.main_body_pane.panes()) > 1 and not self._nav_collapsed:
+            if len(self.main_body_pane.panes()) > 1:
                 self.main_body_pane.sash_place(0, self._nav_width_expanded, 0)
         except tk.TclError:
             pass
@@ -384,6 +359,7 @@ class DesktopApp:
         ).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar2, text="[ORDER] 升降切换", style="Secondary.TButton", command=self._toggle_packet_sort_order).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar2, text="[CMD] 查询流量", style="Secondary.TButton", command=self.load_packets).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar2, text="[RPT] 生成分析报告", style="Secondary.TButton", command=self.generate_traffic_report).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar2, text="[RESET] 重置显示窗口", style="Danger.TButton", command=self.reset_traffic_display).pack(side=tk.LEFT, padx=4)
         ttk.Label(bar2, text="[MODE]:", style="Hint.TLabel").pack(side=tk.LEFT, padx=(6, 0))
         ttk.Combobox(
@@ -524,7 +500,7 @@ class DesktopApp:
         ttk.Button(toolbar, text="[SYNC] 刷新网卡", style="Secondary.TButton", command=self._refresh_interfaces).grid(row=1, column=0, padx=8, pady=(0, 8), sticky="w")
         ttk.Button(toolbar, text="[NIC+] 启用网卡", style="Secondary.TButton", command=self.enable_interface).grid(row=1, column=1, padx=8, pady=(0, 8), sticky="w")
         ttk.Button(toolbar, text="[NIC-] 停用网卡", style="Danger.TButton", command=self.disable_interface).grid(row=1, column=2, padx=8, pady=(0, 8), sticky="w")
-        ttk.Button(toolbar, text="[RPT] 生成分析报告", style="Secondary.TButton", command=self.generate_security_report).grid(row=1, column=3, padx=8, pady=(0, 8), sticky="w")
+        ttk.Button(toolbar, text="[RPT] 生成分析报告", style="Secondary.TButton", command=self.generate_realtime_report).grid(row=1, column=3, padx=8, pady=(0, 8), sticky="w")
         self.mode_tips_var = tk.StringVar(value="* NOTE: fast=30s; standard=3m; no alerts during learning phase.")
         ttk.Label(toolbar, textvariable=self.mode_tips_var, style="Redline.TLabel").grid(row=2, column=0, columnspan=9, padx=8, pady=4, sticky="w")
         self.learning_var = tk.StringVar(value="STATUS: IDLE")
@@ -1821,12 +1797,18 @@ class DesktopApp:
         self.runtime.stop_capture()
         self.runtime.audit.log(self.username, "capture_stop", "-", "desktop")
 
-    def generate_security_report(self) -> None:
+    def _generate_report(self, source: str, report_title: str) -> None:
         if not self._require_admin():
             return
-        report_path = self.runtime.generate_security_report(self.username or "admin")
+        report_path = self.runtime.generate_security_report(self.username or "admin", source=source)
         webbrowser.open(report_path.resolve().as_uri())
-        messagebox.showinfo("OK", f"Report generated:\n{report_path}")
+        messagebox.showinfo("OK", f"{report_title}生成成功:\n{report_path}")
+
+    def generate_realtime_report(self) -> None:
+        self._generate_report("live", "实时监测报告")
+
+    def generate_traffic_report(self) -> None:
+        self._generate_report("offline", "流量分析报告")
 
     def _selected_interface_name(self) -> str | None:
         idx = self.iface_box.current()
@@ -2023,7 +2005,19 @@ class DesktopApp:
         ip = self.list_ip_var.get().strip()
         if not ip:
             return
-        self.runtime.list_service.upsert(ip, self.list_type_var.get(), 1, self.list_remark_var.get().strip())
+        list_type = self.list_type_var.get().strip()
+        if list_type == "black":
+            ok, msg = self.runtime.upsert_blacklist_with_firewall(
+                ip=ip,
+                enabled=1,
+                remark=self.list_remark_var.get().strip(),
+                operator=self.username or "admin",
+            )
+            if not ok:
+                messagebox.showerror("ERR_NET", msg)
+                return
+        else:
+            self.runtime.list_service.upsert(ip, list_type, 1, self.list_remark_var.get().strip())
         self.runtime.audit.log(self.username, "list_upsert", ip, self.list_type_var.get())
         self.list_ip_var.set("")
         self.list_remark_var.set("")
@@ -2034,7 +2028,13 @@ class DesktopApp:
         if not picked:
             return None
         values = self.list_tree.item(picked[0], "values")
-        return {"id": int(values[0]), "enabled": int(values[3]), "remark": values[4]}
+        return {
+            "id": int(values[0]),
+            "ip": str(values[1]),
+            "list_type": str(values[2]),
+            "enabled": int(values[3]),
+            "remark": str(values[4]),
+        }
 
     def toggle_selected_list(self) -> None:
         if not self._require_admin():
@@ -2042,7 +2042,19 @@ class DesktopApp:
         item = self._get_selected_list()
         if not item:
             return
-        self.runtime.list_service.update_item(item["id"], 0 if item["enabled"] == 1 else 1, item["remark"])
+        target_enabled = 0 if item["enabled"] == 1 else 1
+        if str(item["list_type"]).strip().lower() == "black":
+            ok, msg = self.runtime.update_list_item_with_firewall(
+                item_id=int(item["id"]),
+                enabled=target_enabled,
+                remark=str(item["remark"]),
+                operator=self.username or "admin",
+            )
+            if not ok:
+                messagebox.showerror("ERR_NET", msg)
+                return
+        else:
+            self.runtime.list_service.update_item(item["id"], target_enabled, item["remark"])
         self.runtime.audit.log(self.username, "list_update", str(item["id"]), "toggle")
         self.load_list_items()
 
@@ -2052,7 +2064,16 @@ class DesktopApp:
         item = self._get_selected_list()
         if not item:
             return
-        self.runtime.list_service.delete(item["id"])
+        if str(item["list_type"]).strip().lower() == "black":
+            ok, msg = self.runtime.delete_list_item_with_firewall(
+                item_id=int(item["id"]),
+                operator=self.username or "admin",
+            )
+            if not ok:
+                messagebox.showerror("ERR_NET", msg)
+                return
+        else:
+            self.runtime.list_service.delete(item["id"])
         self.runtime.audit.log(self.username, "list_delete", str(item["id"]), "desktop")
         self.load_list_items()
 

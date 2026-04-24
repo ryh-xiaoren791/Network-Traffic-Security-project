@@ -11,26 +11,28 @@ class ReportService:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def generate_visual_report(self, output_path: Path | None = None) -> Path:
-        report_path = output_path or Path("reports") / f"security_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+    def generate_visual_report(self, source: str, output_path: Path | None = None) -> Path:
+        report_source = "offline" if str(source or "").strip().lower() == "offline" else "live"
+        suffix = "traffic" if report_source == "offline" else "realtime"
+        report_path = output_path or Path("reports") / f"security_report_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        summary = self._query_summary()
-        trend_points = self._query_traffic_trend(limit=60)
-        level_pairs = self._query_alert_levels()
-        top_ip_pairs = self._query_top_abnormal_ips()
-        html_text = self._render_html(summary, trend_points, level_pairs, top_ip_pairs)
+        summary = self._query_summary(report_source)
+        trend_points = self._query_traffic_trend(report_source, limit=60)
+        level_pairs = self._query_alert_levels(report_source)
+        top_ip_pairs = self._query_top_abnormal_ips(report_source)
+        html_text = self._render_html(report_source, summary, trend_points, level_pairs, top_ip_pairs)
         report_path.write_text(html_text, encoding="utf-8")
         return report_path
 
-    def _query_summary(self) -> dict:
+    def _query_summary(self, source: str) -> dict:
         c = self.db.conn.cursor()
-        c.execute("SELECT COUNT(*) AS cnt FROM alerts")
+        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE source=?", (source,))
         total_alerts = int(c.fetchone()["cnt"])
-        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE level='high'")
+        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE source=? AND level='high'", (source,))
         high_alerts = int(c.fetchone()["cnt"])
-        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE sub_category='隐私追踪拦截'")
+        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE source=? AND sub_category='隐私追踪拦截'", (source,))
         privacy_blocks = int(c.fetchone()["cnt"])
-        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE ts >= datetime('now', '-24 hours')")
+        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE source=? AND ts >= datetime('now', '-24 hours')", (source,))
         recent_alerts = int(c.fetchone()["cnt"])
         c.execute("SELECT COUNT(*) AS cnt FROM blacklist_whitelist WHERE list_type='black' AND enabled=1")
         black_items = int(c.fetchone()["cnt"])
@@ -42,38 +44,51 @@ class ReportService:
             "black_items": black_items,
         }
 
-    def _query_traffic_trend(self, limit: int = 60) -> list[tuple[str, int]]:
+    def _query_traffic_trend(self, source: str, limit: int = 60) -> list[tuple[str, int]]:
         c = self.db.conn.cursor()
         c.execute(
-            "SELECT ts, inbound_packets FROM traffic_stats ORDER BY id DESC LIMIT ?",
-            (limit,),
+            """
+            SELECT substr(ts, 1, 16) AS ts_minute, COUNT(*) AS packet_count
+            FROM captured_packets
+            WHERE source=?
+            GROUP BY ts_minute
+            ORDER BY ts_minute DESC
+            LIMIT ?
+            """,
+            (source, limit),
         )
         rows = [dict(r) for r in c.fetchall()]
         rows.reverse()
         points: list[tuple[str, int]] = []
         for row in rows:
-            label = str(row["ts"])[11:19] if row["ts"] else ""
-            points.append((label, int(row["inbound_packets"] or 0)))
+            ts_text = str(row.get("ts_minute") or "")
+            label = ts_text[11:16] if len(ts_text) >= 16 else ts_text
+            points.append((label, int(row.get("packet_count") or 0)))
         return points
 
-    def _query_alert_levels(self) -> list[tuple[str, int]]:
+    def _query_alert_levels(self, source: str) -> list[tuple[str, int]]:
         c = self.db.conn.cursor()
-        c.execute("SELECT level, COUNT(*) AS cnt FROM alerts GROUP BY level")
+        c.execute("SELECT level, COUNT(*) AS cnt FROM alerts WHERE source=? GROUP BY level", (source,))
         rows = {str(r["level"]): int(r["cnt"]) for r in c.fetchall()}
         return [("high", rows.get("high", 0)), ("medium", rows.get("medium", 0)), ("low", rows.get("low", 0))]
 
-    def _query_top_abnormal_ips(self) -> list[tuple[str, int]]:
+    def _query_top_abnormal_ips(self, source: str) -> list[tuple[str, int]]:
         c = self.db.conn.cursor()
-        c.execute("SELECT src_ip, COUNT(*) AS cnt FROM alerts GROUP BY src_ip ORDER BY cnt DESC LIMIT 8")
+        c.execute(
+            "SELECT src_ip, COUNT(*) AS cnt FROM alerts WHERE source=? GROUP BY src_ip ORDER BY cnt DESC LIMIT 8",
+            (source,),
+        )
         return [(str(r["src_ip"] or "-"), int(r["cnt"])) for r in c.fetchall()]
 
     def _render_html(
         self,
+        source: str,
         summary: dict,
         trend_points: list[tuple[str, int]],
         level_pairs: list[tuple[str, int]],
         top_ip_pairs: list[tuple[str, int]],
     ) -> str:
+        report_name = "流量分析报告" if source == "offline" else "实时监测报告"
         trend_svg = self._line_chart_svg(trend_points, "Inbound Traffic Trend")
         level_svg = self._bar_chart_svg(level_pairs, "Alert Level Distribution")
         top_ip_svg = self._bar_chart_svg(top_ip_pairs, "Top Abnormal Source IPs")
@@ -84,7 +99,7 @@ class ReportService:
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Security Monitoring Analysis Report</title>
+<title>{html.escape(report_name)}</title>
 <style>
 body{{font-family:Segoe UI,Arial,sans-serif;background:#f4f7fb;color:#1f2937;margin:0;padding:24px;}}
 h1{{margin:0 0 8px 0;font-size:28px;}}
@@ -98,7 +113,7 @@ svg{{width:100%;height:auto;}}
 </style>
 </head>
 <body>
-<h1>Device Security Analysis Report</h1>
+<h1>{html.escape(report_name)}</h1>
 <p class="sub">Generated at {html.escape(now)}</p>
 <div class="grid">
 <div class="card"><div class="k">Total Alerts</div><div class="v">{summary["total_alerts"]}</div></div>
