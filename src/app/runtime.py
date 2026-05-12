@@ -18,17 +18,25 @@ try:
 except Exception:  # pragma: no cover - optional runtime dependency
     psutil = None
 
+from src.app.packet_queries import (
+    query_offline_frames_page as packet_query_offline_frames_page,
+    query_packets_filtered as packet_query_packets_filtered,
+    query_packets_page as packet_query_packets_page,
+)
+from src.app.offline_imports import import_offline_pcap as run_offline_import
+from src.subprocess_utils import run_command_capture
 from src.config import CONFIG
 from src.core.aggregation.session_aggregator import SessionAggregator
 from src.core.audit.service import AuditService
 from src.core.capture.capture_engine import CaptureEngine
+from src.core.ctf import FlowWorkbenchService, PacketBatchExportService
 from src.core.detection.model_engine import ModelEngine
 from src.core.detection.rule_engine import RuleEngine
 from src.core.detection.service import DetectionService
 from src.core.detection.attack_knowledge import get_attack_knowledge
 from src.core.notify.service import NotificationService
-from src.core.offline import OfflineParserConfig, OfflineParserError, iter_offline_batches
-from src.core.offline.adapter import LegacyPacketBatchView
+from src.core.offline import OfflineParserConfig, OfflineParserError
+from src.core.offline.adapter import LegacyPacketBatchView, iter_offline_generic_frames
 from src.core.report.service import ReportService
 from src.core.storage.db import Database, now_text
 from src.core.storage.offline_packet_store import OfflinePacketStore
@@ -49,25 +57,45 @@ class OfflineImportProfile:
     detection_flush_interval_batches: int
 
 
+@dataclass(frozen=True)
+class AppRuntimeDeps:
+    db: Database | None = None
+    audit: AuditService | None = None
+    list_service: ListService | None = None
+    model_engine: ModelEngine | None = None
+    rule_engine: RuleEngine | None = None
+    detector: DetectionService | None = None
+    notifier: NotificationService | None = None
+    report_service: ReportService | None = None
+    flow_workbench: FlowWorkbenchService | None = None
+    packet_batch_export: PacketBatchExportService | None = None
+    offline_packet_store: OfflinePacketStore | None = None
+    capture: CaptureEngine | None = None
+    aggregator: SessionAggregator | None = None
+
+
 class AppRuntime:
-    def __init__(self) -> None:
-        self.db = Database()
-        self.audit = AuditService(self.db)
-        self.list_service = ListService(self.db)
-        self.model_engine = ModelEngine(CONFIG.model_path)
-        self.rule_engine = RuleEngine()
-        self.detector = DetectionService(self.db, self.list_service, self.model_engine, self.rule_engine)
-        self.notifier = NotificationService()
-        self.report_service = ReportService(self.db)
-        self.offline_packet_store: OfflinePacketStore | None = None
-        if bool(getattr(CONFIG, "offline_use_duckdb", True)):
+    def __init__(self, deps: AppRuntimeDeps | None = None) -> None:
+        resolved = deps or AppRuntimeDeps()
+        self.db = resolved.db or Database()
+        self.audit = resolved.audit or AuditService(self.db)
+        self.list_service = resolved.list_service or ListService(self.db)
+        self.model_engine = resolved.model_engine or ModelEngine(CONFIG.model_path)
+        self.rule_engine = resolved.rule_engine or RuleEngine()
+        self.detector = resolved.detector or DetectionService(self.db, self.list_service, self.model_engine, self.rule_engine)
+        self.notifier = resolved.notifier or NotificationService()
+        self.report_service = resolved.report_service or ReportService(self.db)
+        self.flow_workbench = resolved.flow_workbench or FlowWorkbenchService()
+        self.packet_batch_export = resolved.packet_batch_export or PacketBatchExportService()
+        self.offline_packet_store: OfflinePacketStore | None = resolved.offline_packet_store
+        if self.offline_packet_store is None and bool(getattr(CONFIG, "offline_use_duckdb", True)):
             try:
                 self.offline_packet_store = OfflinePacketStore(Path(getattr(CONFIG, "offline_duckdb_path", Path("data/offline_packets.duckdb"))))
             except Exception:
                 self.offline_packet_store = None
         self.packet_queue: queue.Queue = queue.Queue(maxsize=10000)
-        self.capture = CaptureEngine(self.packet_queue)
-        self.aggregator = SessionAggregator()
+        self.capture = resolved.capture or CaptureEngine(self.packet_queue)
+        self.aggregator = resolved.aggregator or SessionAggregator()
         self.blocked_ips: set[str] = set()
         self.running = False
         self.worker: threading.Thread | None = None
@@ -102,6 +130,11 @@ class AppRuntime:
         self._offline_feature_buffer: list[dict] = []
         self._offline_feature_flush_size = 8000
         self._offline_detection_batch_counter = 0
+        self._traffic_stat_interval_seconds = 5.0
+        self._log_cleanup_interval_seconds = 300.0
+        self._last_traffic_stat_flush_ts = 0.0
+        self._last_log_cleanup_ts = 0.0
+        self._packet_query_chunk_size = 1000
         self._bootstrap_firewall_blacklist_sync()
 
     @staticmethod
@@ -165,14 +198,28 @@ class AppRuntime:
         self.capture.start(interface, capture_outbound)
         if not self.running:
             self.running = True
+            self._last_traffic_stat_flush_ts = time.time()
+            self._last_log_cleanup_ts = time.time()
             self.worker = threading.Thread(target=self._worker_loop, daemon=True)
             self.worker.start()
 
     def stop_capture(self) -> None:
         self.capture.stop()
+        self._flush_realtime_traffic_stat(force=True)
         self.running = False
+        worker = self.worker
+        self.worker = None
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=max(1.0, CONFIG.capture_batch_timeout * 4))
         # 停止环境预识别（学习模式）
         self.detector.learning_until = 0
+
+    def close(self) -> None:
+        self.stop_capture()
+        self.list_service.close()
+        if self.offline_packet_store is not None:
+            self.offline_packet_store.close()
+        self.db.close()
 
     def set_interface_enabled(self, interface: str, enabled: bool) -> tuple[bool, str]:
         return self.capture.set_interface_enabled(interface, enabled)
@@ -195,7 +242,7 @@ class AppRuntime:
             alerts = self.detector.process(features, source="live")
             self._update_summary(batch, alerts)
             self._notify_high_risk_alerts(alerts)
-            self._save_traffic_stat()
+            self._run_realtime_maintenance(now_ts)
 
     def _update_summary(self, batch: list[dict], alerts: list[dict]) -> None:
         self.last_summary["total_packets"] += len(batch)
@@ -223,14 +270,31 @@ class AppRuntime:
             "firewall_blocks": len(self.blocked_ips),
         }
 
-    def _save_traffic_stat(self) -> None:
+    def _run_realtime_maintenance(self, now_ts: float) -> None:
+        self._flush_realtime_traffic_stat(now_ts=now_ts)
+        self._cleanup_old_logs_if_due(now_ts=now_ts)
+
+    def _flush_realtime_traffic_stat(self, now_ts: float | None = None, force: bool = False) -> None:
+        ts_now = float(now_ts or time.time())
+        if not force and ts_now - self._last_traffic_stat_flush_ts < self._traffic_stat_interval_seconds:
+            return
+        if int(self.last_summary.get("total_packets", 0) or 0) <= 0:
+            self._last_traffic_stat_flush_ts = ts_now
+            return
         c = self.db.conn.cursor()
         c.execute(
             "INSERT INTO traffic_stats(ts, inbound_packets, outbound_packets, active_sessions) VALUES(?,?,?,?)",
             (now_text(), self.last_summary["total_packets"], 0, self.last_summary["active_sessions"]),
         )
         self.db.conn.commit()
+        self._last_traffic_stat_flush_ts = ts_now
+
+    def _cleanup_old_logs_if_due(self, now_ts: float | None = None) -> None:
+        ts_now = float(now_ts or time.time())
+        if ts_now - self._last_log_cleanup_ts < self._log_cleanup_interval_seconds:
+            return
         self.db.cleanup_old_logs()
+        self._last_log_cleanup_ts = ts_now
 
     def _notify_high_risk_alerts(self, alerts: list[dict]) -> None:
         for alert in alerts:
@@ -453,16 +517,52 @@ class AppRuntime:
     @staticmethod
     def _build_packet_rule_sql(expression: str) -> tuple[str, list]:
         expr = str(expression or "").strip()
-        if not expr:
-            return "", []
-        # 仅支持可安全下推到SQL的子集；其余情况由上层Python过滤兜底。
-        if "||" in expr or "!" in expr:
+        if not expr or "||" in expr or "!" in expr:
             return "", []
         parts = [p.strip() for p in expr.split("&&") if p.strip()]
         if not parts:
             return "", []
         clauses: list[str] = []
         args: list = []
+        text_fields = {"process": "process_name", "process_name": "process_name", "proto": "proto", "source": "source"}
+        scalar_fields = {
+            "ip.src": "src_ip",
+            "src_ip": "src_ip",
+            "ip.dst": "dst_ip",
+            "dst_ip": "dst_ip",
+            "tcp.srcport": "src_port",
+            "udp.srcport": "src_port",
+            "src_port": "src_port",
+            "tcp.dstport": "dst_port",
+            "udp.dstport": "dst_port",
+            "dst_port": "dst_port",
+            "frame.len": "length",
+            "len": "length",
+            "length": "length",
+            "frame.number": "id",
+            "id": "id",
+            "process": "process_name",
+            "process_name": "process_name",
+            "proto": "proto",
+            "source": "source",
+        }
+        pair_fields = {
+            "ip.addr": ("src_ip", "dst_ip"),
+            "ip": ("src_ip", "dst_ip"),
+            "port": ("src_port", "dst_port"),
+            "tcp.port": ("src_port", "dst_port"),
+            "udp.port": ("src_port", "dst_port"),
+        }
+        numeric_fields = {"port", "tcp.port", "udp.port", "tcp.srcport", "udp.srcport", "src_port", "tcp.dstport", "udp.dstport", "dst_port", "frame.len", "len", "length", "frame.number", "id"}
+
+        def coerce_value(field: str, raw: str):
+            if field not in numeric_fields:
+                return raw.upper() if field == "proto" else raw
+            try:
+                return int(float(raw))
+            except Exception:
+                return None
+
         for term in parts:
             low = term.lower()
             if low in {"tcp", "udp", "icmp"}:
@@ -475,14 +575,11 @@ class AppRuntime:
                 value = str(m_contains.group(2) or "").strip().strip("'").strip('"')
                 if not value:
                     continue
-                if field in {"process", "process_name"}:
-                    clauses.append("process_name LIKE ?")
-                    args.append(f"%{value}%")
-                elif field in {"ip", "ip.addr"}:
+                if field in {"ip", "ip.addr"}:
                     clauses.append("(src_ip LIKE ? OR dst_ip LIKE ?)")
                     args.extend([f"%{value}%", f"%{value}%"])
-                elif field in {"proto", "source"}:
-                    clauses.append(f"{field} LIKE ?")
+                elif field in text_fields:
+                    clauses.append(f"{text_fields[field]} LIKE ?")
                     args.append(f"%{value}%")
                 else:
                     return "", []
@@ -494,68 +591,219 @@ class AppRuntime:
             op = str(m.group(2) or "").strip()
             value_raw = str(m.group(3) or "").strip().strip("'").strip('"')
             op_sql = "=" if op == "==" else op
-            if field in {"ip.src", "src_ip"}:
-                clauses.append(f"src_ip {op_sql} ?")
-                args.append(value_raw)
-            elif field in {"ip.dst", "dst_ip"}:
-                clauses.append(f"dst_ip {op_sql} ?")
-                args.append(value_raw)
-            elif field in {"ip.addr", "ip"}:
-                clauses.append(f"(src_ip {op_sql} ? OR dst_ip {op_sql} ?)")
-                args.extend([value_raw, value_raw])
-            elif field in {"port", "tcp.port", "udp.port"}:
-                try:
-                    v = int(float(value_raw))
-                except Exception:
-                    return "", []
-                clauses.append(f"(src_port {op_sql} ? OR dst_port {op_sql} ?)")
-                args.extend([v, v])
-            elif field in {"tcp.srcport", "udp.srcport", "src_port"}:
-                try:
-                    v = int(float(value_raw))
-                except Exception:
-                    return "", []
-                clauses.append(f"src_port {op_sql} ?")
-                args.append(v)
-            elif field in {"tcp.dstport", "udp.dstport", "dst_port"}:
-                try:
-                    v = int(float(value_raw))
-                except Exception:
-                    return "", []
-                clauses.append(f"dst_port {op_sql} ?")
-                args.append(v)
-            elif field in {"frame.len", "len", "length"}:
-                try:
-                    v = int(float(value_raw))
-                except Exception:
-                    return "", []
-                clauses.append(f"length {op_sql} ?")
-                args.append(v)
-            elif field in {"frame.number"}:
-                try:
-                    v = int(float(value_raw))
-                except Exception:
-                    return "", []
-                clauses.append(f"id {op_sql} ?")
-                args.append(v)
-            elif field in {"process", "process_name"}:
-                clauses.append(f"process_name {op_sql} ?")
-                args.append(value_raw)
-            elif field in {"proto", "source"}:
-                clauses.append(f"{field} {op_sql} ?")
-                args.append(value_raw.upper() if field == "proto" else value_raw)
-            elif field in {"id"}:
-                try:
-                    v = int(float(value_raw))
-                except Exception:
-                    return "", []
-                clauses.append(f"id {op_sql} ?")
-                args.append(v)
+            value = coerce_value(field, value_raw)
+            if value is None:
+                return "", []
+            if field in pair_fields:
+                left, right = pair_fields[field]
+                clauses.append(f"({left} {op_sql} ? OR {right} {op_sql} ?)")
+                args.extend([value, value])
+            elif field in scalar_fields:
+                clauses.append(f"{scalar_fields[field]} {op_sql} ?")
+                args.append(value)
             else:
                 return "", []
         if not clauses:
             return "", []
         return " AND " + " AND ".join(f"({c})" for c in clauses), args
+
+    @staticmethod
+    def _packet_sort_value(row: dict, key: str):
+        normalized = str(key or "").strip().lower()
+        if normalized in {"id", "src_port", "dst_port", "length"}:
+            return int(row.get(normalized, 0) or 0)
+        if normalized == "risk_level":
+            return {"high": 3, "medium": 2, "low": 1}.get(str(row.get("risk_level", "normal")).lower(), 0)
+        if normalized == "ts":
+            return float(row.get("ts_epoch", 0.0) or 0.0)
+        return str(row.get(normalized, "") or "").lower()
+
+    @staticmethod
+    def _normalize_packet_sort_key(sort_key: str) -> str:
+        key = str(sort_key or "").strip().lower()
+        if key in {"", "no", "delta"}:
+            return "ts"
+        allowed = {"ts", "id", "risk_level", "process_name", "src_ip", "dst_ip", "src_port", "dst_port", "proto", "length", "source"}
+        return key if key in allowed else "ts"
+
+    def _build_packet_sort_sql(self, sort_key: str, sort_desc: bool) -> str:
+        key = self._normalize_packet_sort_key(sort_key)
+        direction = "DESC" if sort_desc else "ASC"
+        field_map = {
+            "ts": "ts",
+            "id": "id",
+            "process_name": "LOWER(process_name)",
+            "src_ip": "src_ip",
+            "dst_ip": "dst_ip",
+            "src_port": "src_port",
+            "dst_port": "dst_port",
+            "proto": "proto",
+            "length": "length",
+            "source": "source",
+        }
+        field_sql = field_map.get(key, "ts")
+        return f"{field_sql} {direction}, id {direction}"
+
+    def _normalize_packet_rows(self, rows: list[dict]) -> list[dict]:
+        for row in rows:
+            row["ts_epoch"] = self._parse_ts_float(row.get("ts", 0.0))
+            row["ts"] = self._render_ts_text(row.get("ts", ""))
+        return rows
+
+    def _count_packet_rows(self, process_name: str = "", ip: str = "", source: str = "", extra_sql: str = "", extra_args: list | None = None) -> int:
+        args = list(extra_args or [])
+        if source == "offline" and self._offline_store_enabled():
+            assert self.offline_packet_store is not None
+            return self.offline_packet_store.count_packets(
+                process_name=process_name,
+                ip=ip,
+                source="offline",
+                extra_sql=extra_sql,
+                extra_args=args,
+            )
+        c = self.db.conn.cursor()
+        sql = """
+            SELECT COUNT(1)
+            FROM captured_packets
+            WHERE 1=1
+        """
+        query_args: list[object] = []
+        if process_name:
+            sql += " AND process_name LIKE ?"
+            query_args.append(f"%{process_name}%")
+        if ip:
+            sql += " AND (src_ip LIKE ? OR dst_ip LIKE ?)"
+            query_args.extend([f"%{ip}%", f"%{ip}%"])
+        if source:
+            sql += " AND source=?"
+            query_args.append(source)
+        elif self._offline_store_enabled():
+            sql += " AND source <> 'offline'"
+        if extra_sql:
+            sql += extra_sql
+            query_args.extend(args)
+        c.execute(sql, tuple(query_args))
+        row = c.fetchone()
+        return int(row[0] if row else 0)
+
+    def _query_packet_rows_chunk(
+        self,
+        limit: int,
+        offset: int = 0,
+        process_name: str = "",
+        ip: str = "",
+        source: str = "",
+        extra_sql: str = "",
+        extra_args: list | None = None,
+        sort_key: str = "ts",
+        sort_desc: bool = True,
+    ) -> list[dict]:
+        key = self._normalize_packet_sort_key(sort_key)
+        args = list(extra_args or [])
+        if source == "offline" and self._offline_store_enabled():
+            assert self.offline_packet_store is not None
+            rows = self.offline_packet_store.query_packets(
+                limit=limit,
+                offset=offset,
+                process_name=process_name,
+                ip=ip,
+                source="offline",
+                extra_sql=extra_sql,
+                extra_args=args,
+                sort_key=key,
+                sort_desc=sort_desc,
+            )
+            return self._normalize_packet_rows(rows)
+        c = self.db.conn.cursor()
+        sql = """
+            SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, direction, process_id, process_name, source
+            FROM captured_packets
+            WHERE 1=1
+        """
+        query_args: list[object] = []
+        if process_name:
+            sql += " AND process_name LIKE ?"
+            query_args.append(f"%{process_name}%")
+        if ip:
+            sql += " AND (src_ip LIKE ? OR dst_ip LIKE ?)"
+            query_args.extend([f"%{ip}%", f"%{ip}%"])
+        if source:
+            sql += " AND source=?"
+            query_args.append(source)
+        elif self._offline_store_enabled():
+            sql += " AND source <> 'offline'"
+        if extra_sql:
+            sql += extra_sql
+            query_args.extend(args)
+        sql += f" ORDER BY {self._build_packet_sort_sql(key, sort_desc)}"
+        sql += " LIMIT ? OFFSET ?"
+        query_args.extend([max(1, int(limit)), max(0, int(offset))])
+        c.execute(sql, tuple(query_args))
+        rows = [dict(r) for r in c.fetchall()]
+        return self._normalize_packet_rows(rows)
+
+    def query_packets_page(
+        self,
+        page: int = 1,
+        page_size: int = 500,
+        process_name: str = "",
+        ip: str = "",
+        source: str = "",
+        rule_expr: str = "",
+        only_abnormal: bool = False,
+        sort_key: str = "ts",
+        sort_desc: bool = True,
+    ) -> dict:
+        return packet_query_packets_page(
+            self,
+            page=page,
+            page_size=page_size,
+            process_name=process_name,
+            ip=ip,
+            source=source,
+            rule_expr=rule_expr,
+            only_abnormal=only_abnormal,
+            sort_key=sort_key,
+            sort_desc=sort_desc,
+        )
+
+    def query_packets_filtered(
+        self,
+        process_name: str = "",
+        ip: str = "",
+        source: str = "",
+        rule_expr: str = "",
+        only_abnormal: bool = False,
+        sort_key: str = "ts",
+        sort_desc: bool = True,
+        max_rows: int = 20000,
+    ) -> dict:
+        return packet_query_packets_filtered(
+            self,
+            process_name=process_name,
+            ip=ip,
+            source=source,
+            rule_expr=rule_expr,
+            only_abnormal=only_abnormal,
+            sort_key=sort_key,
+            sort_desc=sort_desc,
+            max_rows=max_rows,
+        )
+
+    def query_offline_frames_page(
+        self,
+        page: int = 1,
+        page_size: int = 500,
+        search_text: str = "",
+        linktype: int = 0,
+    ) -> dict:
+        return packet_query_offline_frames_page(
+            self,
+            page=page,
+            page_size=page_size,
+            search_text=search_text,
+            linktype=linktype,
+        )
 
     def query_packets(self, limit: int | None = None, process_name: str = "", ip: str = "", source: str = "", rule_expr: str = "") -> list[dict]:
         extra_sql, extra_args = self._build_packet_rule_sql(rule_expr)
@@ -598,9 +846,7 @@ class AppRuntime:
                 args.append(int(limit))
             c.execute(sql, tuple(args))
             rows = [dict(r) for r in c.fetchall()]
-        for row in rows:
-            row["ts_epoch"] = self._parse_ts_float(row.get("ts", 0.0))
-            row["ts"] = self._render_ts_text(row.get("ts", ""))
+        rows = self._normalize_packet_rows(rows)
         if not rows:
             return rows
         return self._attach_packet_risk(rows)
@@ -608,42 +854,62 @@ class AppRuntime:
     def _attach_packet_risk(self, rows: list[dict]) -> list[dict]:
         if not rows:
             return rows
-        ips = {str(r.get("src_ip", "") or "") for r in rows} | {str(r.get("dst_ip", "") or "") for r in rows}
-        ips.discard("")
-        if not ips:
+        c = self.db.conn.cursor()
+        value_rows: list[str] = []
+        args: list[object] = []
+        flow_risk: dict[tuple[str, str, int, int, str, str], int] = {}
+        for packet in rows:
+            src = str(packet.get("src_ip", "") or "")
+            dst = str(packet.get("dst_ip", "") or "")
+            src_port = int(packet.get("src_port", 0) or 0)
+            dst_port = int(packet.get("dst_port", 0) or 0)
+            proto = str(packet.get("proto", "") or "").upper()
+            source = str(packet.get("source", "live") or "live")
+            key = (src, dst, src_port, dst_port, proto, source)
+            if key in flow_risk:
+                continue
+            flow_risk[key] = 0
+            value_rows.append("(?, ?, ?, ?, ?, ?)")
+            args.extend([src, dst, src_port, dst_port, proto, source])
+        if not value_rows:
             for row in rows:
                 row["risk_level"] = "normal"
             return rows
-        c = self.db.conn.cursor()
-        placeholders = ",".join(["?"] * len(ips))
-        alert_sql = f"""
-            SELECT src_ip, dst_ip, src_port, dst_port, proto, level, ts
-            FROM alerts
-            WHERE (src_ip IN ({placeholders}) OR dst_ip IN ({placeholders}))
-            ORDER BY id DESC
-            LIMIT 8000
-        """
-        alert_args = tuple(ips) + tuple(ips)
-        c.execute(alert_sql, alert_args)
-        flow_risk: dict[tuple[str, str, int, int, str], int] = {}
-        for row in c.fetchall():
-            src = str(row["src_ip"] or "")
-            dst = str(row["dst_ip"] or "")
-            src_port = int(row["src_port"] or 0)
-            dst_port = int(row["dst_port"] or 0)
-            proto = str(row["proto"] or "").upper()
-            rank = self._level_rank(str(row["level"] or ""))
-            key = (src, dst, src_port, dst_port, proto)
-            rev = (dst, src, dst_port, src_port, proto)
-            flow_risk[key] = max(rank, flow_risk.get(key, 0))
-            flow_risk[rev] = max(rank, flow_risk.get(rev, 0))
+        c.execute(
+            f"""
+            WITH requested_flows(src_ip, dst_ip, src_port, dst_port, proto, source) AS (
+                VALUES {", ".join(value_rows)}
+            )
+            SELECT summary.src_ip, summary.dst_ip, summary.src_port, summary.dst_port, summary.proto, summary.source, summary.max_level_rank
+            FROM flow_risk_summary AS summary
+            INNER JOIN requested_flows AS requested
+                ON summary.src_ip = requested.src_ip
+               AND summary.dst_ip = requested.dst_ip
+               AND summary.src_port = requested.src_port
+               AND summary.dst_port = requested.dst_port
+               AND summary.proto = requested.proto
+               AND summary.source = requested.source
+            """,
+            tuple(args),
+        )
+        for summary_row in c.fetchall():
+            key = (
+                str(summary_row["src_ip"] or ""),
+                str(summary_row["dst_ip"] or ""),
+                int(summary_row["src_port"] or 0),
+                int(summary_row["dst_port"] or 0),
+                str(summary_row["proto"] or "").upper(),
+                str(summary_row["source"] or "live"),
+            )
+            flow_risk[key] = max(flow_risk.get(key, 0), int(summary_row["max_level_rank"] or 0))
         for row in rows:
             src = str(row["src_ip"] or "")
             dst = str(row["dst_ip"] or "")
             src_port = int(row.get("src_port", 0) or 0)
             dst_port = int(row.get("dst_port", 0) or 0)
             proto = str(row.get("proto", "") or "").upper()
-            rank = flow_risk.get((src, dst, src_port, dst_port, proto), 0)
+            source = str(row.get("source", "live") or "live")
+            rank = flow_risk.get((src, dst, src_port, dst_port, proto, source), 0)
             row["risk_level"] = self._rank_level(rank)
         return rows
 
@@ -687,17 +953,16 @@ class AppRuntime:
         return rows
 
     def query_packet_detail(self, packet_id: int) -> dict | None:
-        c = self.db.conn.cursor()
-        c.execute("SELECT * FROM captured_packets WHERE id=?", (packet_id,))
-        row = c.fetchone()
-        packet: dict | None = dict(row) if row else None
-        if not packet and self._offline_store_enabled():
-            assert self.offline_packet_store is not None
-            packet = self.offline_packet_store.query_packet_detail(int(packet_id))
-        if not packet:
-            return None
+        details = self.query_packet_details([packet_id], include_related_alerts=True)
+        return details.get(int(packet_id))
+
+    def _normalize_packet_detail_row(self, packet: dict) -> dict:
         packet["ts_epoch"] = self._parse_ts_float(packet.get("ts", 0.0))
         packet["ts"] = self._render_ts_text(packet.get("ts", ""))
+        return packet
+
+    def _query_related_alerts(self, packet: Mapping[str, object], limit: int = 5) -> list[dict]:
+        c = self.db.conn.cursor()
         c.execute(
             """
             SELECT ts, level, reason, sub_category
@@ -719,8 +984,71 @@ class AppRuntime:
                 str(packet.get("proto", "") or "").upper(),
             ),
         )
-        packet["related_alerts"] = [dict(r) for r in c.fetchall()]
-        return packet
+        return [dict(r) for r in c.fetchall()[: max(1, int(limit))]]
+
+    @staticmethod
+    def _normalize_unique_ids(values: Sequence[int]) -> list[int]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for value in values:
+            normalized = int(value or 0)
+            if normalized > 0 and normalized not in seen:
+                seen.add(normalized)
+                out.append(normalized)
+        return out
+
+    def query_packet_details(self, packet_ids: Sequence[int], include_related_alerts: bool = False) -> dict[int, dict]:
+        normalized_ids = self._normalize_unique_ids(packet_ids)
+        if not normalized_ids:
+            return {}
+
+        results: dict[int, dict] = {}
+        live_ids: list[int] = []
+        offline_ids: list[int] = []
+        offline_base = int(getattr(OfflinePacketStore, "OFFLINE_ID_BASE", 10_000_000_000))
+        for packet_id in normalized_ids:
+            if self._offline_store_enabled() and packet_id >= offline_base:
+                offline_ids.append(packet_id)
+            else:
+                live_ids.append(packet_id)
+
+        if live_ids:
+            placeholders = ",".join(["?"] * len(live_ids))
+            c = self.db.conn.cursor()
+            c.execute(f"SELECT * FROM captured_packets WHERE id IN ({placeholders})", tuple(live_ids))
+            for row in c.fetchall():
+                packet = self._normalize_packet_detail_row(dict(row))
+                if include_related_alerts:
+                    packet["related_alerts"] = self._query_related_alerts(packet)
+                results[int(packet["id"])] = packet
+
+        if offline_ids and self._offline_store_enabled():
+            assert self.offline_packet_store is not None
+            for packet in self.offline_packet_store.query_packet_details(offline_ids):
+                normalized_packet = self._normalize_packet_detail_row(packet)
+                normalized_packet["related_alerts"] = self._query_related_alerts(normalized_packet) if include_related_alerts else []
+                results[int(normalized_packet["id"])] = normalized_packet
+
+        return results
+
+    def query_offline_frame_detail(self, frame_id: int) -> dict | None:
+        details = self.query_offline_frame_details([frame_id])
+        return details.get(int(frame_id))
+
+    def query_offline_frame_details(self, frame_ids: Sequence[int]) -> dict[int, dict]:
+        if not self._offline_store_enabled():
+            return {}
+        assert self.offline_packet_store is not None
+        normalized_ids = self._normalize_unique_ids(frame_ids)
+        if not normalized_ids:
+            return {}
+        details: dict[int, dict] = {}
+        for frame in self.offline_packet_store.query_frame_details(normalized_ids):
+            frame["ts_epoch"] = self._parse_ts_float(frame.get("ts", 0.0))
+            frame["ts"] = self._render_ts_text(frame.get("ts", ""))
+            frame["related_alerts"] = []
+            details[int(frame["id"])] = frame
+        return details
 
     def query_flow_packets(self, packet_id: int, limit: int = 3000) -> list[dict]:
         pid = int(packet_id)
@@ -732,53 +1060,75 @@ class AppRuntime:
                 row["ts"] = self._render_ts_text(row.get("ts", ""))
             return rows
 
-        detail = self.query_packet_detail(pid)
-        if not detail:
-            return []
-        src_ip = str(detail.get("src_ip", "") or "")
-        dst_ip = str(detail.get("dst_ip", "") or "")
-        src_port = int(detail.get("src_port", 0) or 0)
-        dst_port = int(detail.get("dst_port", 0) or 0)
-        proto = str(detail.get("proto", "") or "").upper()
-        source = str(detail.get("source", "") or "")
         c = self.db.conn.cursor()
-        args: list[object] = [
-            proto,
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            dst_ip,
-            src_ip,
-            dst_port,
-            src_port,
-        ]
-        source_sql = ""
-        if source:
-            source_sql = " AND source=?"
-            args.append(source)
-        args.append(max(1, int(limit)))
         c.execute(
-            f"""
-            SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, process_name, raw_hex, source
-            FROM captured_packets
-            WHERE proto=?
-              AND (
-                (src_ip=? AND dst_ip=? AND src_port=? AND dst_port=?)
-                OR
-                (src_ip=? AND dst_ip=? AND src_port=? AND dst_port=?)
-              )
-              {source_sql}
+            """
+            WITH seed AS (
+                SELECT src_ip, dst_ip, src_port, dst_port, proto, source
+                FROM captured_packets
+                WHERE id = ?
+                LIMIT 1
+            )
+            SELECT p.id, p.ts, p.src_ip, p.dst_ip, p.src_port, p.dst_port, p.proto, p.length, p.process_name, p.raw_hex, p.source
+            FROM captured_packets AS p
+            INNER JOIN seed AS s
+                ON p.proto = UPPER(COALESCE(s.proto, ''))
+               AND (
+                    (p.src_ip = s.src_ip AND p.dst_ip = s.dst_ip AND p.src_port = s.src_port AND p.dst_port = s.dst_port)
+                    OR
+                    (p.src_ip = s.dst_ip AND p.dst_ip = s.src_ip AND p.src_port = s.dst_port AND p.dst_port = s.src_port)
+               )
+               AND (COALESCE(s.source, '') = '' OR p.source = s.source)
             ORDER BY ts ASC, id ASC
             LIMIT ?
             """,
-            tuple(args),
+            (pid, max(1, int(limit))),
         )
         rows = [dict(r) for r in c.fetchall()]
         for row in rows:
             row["ts_epoch"] = self._parse_ts_float(row.get("ts", 0.0))
             row["ts"] = self._render_ts_text(row.get("ts", ""))
         return rows
+
+    def analyze_flow(self, packet_id: int, limit: int = 3000, direction_mode: str = "interleaved") -> dict:
+        rows = self.query_flow_packets(packet_id=packet_id, limit=limit)
+        if not rows:
+            return {
+                "direction_mode": direction_mode,
+                "segment_count": 0,
+                "client_to_server": {"label": "C->S", "payload_bytes": b"", "payload_size": 0, "packet_ids": []},
+                "server_to_client": {"label": "S->C", "payload_bytes": b"", "payload_size": 0, "packet_ids": []},
+                "interleaved": {"label": "双向交错", "payload_bytes": b"", "payload_size": 0, "packet_ids": []},
+                "segments": [],
+                "candidates": [],
+                "assets": [],
+                "objects": [],
+            }
+        first = rows[0]
+        return self.flow_workbench.analyze_flow(
+            rows=rows,
+            anchor_src=str(first.get("src_ip", "") or ""),
+            anchor_sport=int(first.get("src_port", 0) or 0),
+            direction_mode=str(direction_mode or "interleaved"),
+        )
+
+    def render_flow_stream_text(self, analysis: dict, mode: str = "ascii", direction_mode: str = "interleaved") -> str:
+        return self.flow_workbench.render_stream_text(
+            analysis=analysis,
+            mode=str(mode or "ascii"),
+            direction_mode=str(direction_mode or "interleaved"),
+        )
+
+    def export_flow_artifact(self, analysis: dict, output_path: Path, artifact: str, file_format: str) -> Path:
+        return self.flow_workbench.export_flow_artifact(
+            analysis=analysis,
+            output_path=output_path,
+            artifact=str(artifact or "interleaved"),
+            file_format=str(file_format or "txt"),
+        )
+
+    def export_carved_object(self, object_row: dict, output_path: Path) -> Path:
+        return self.flow_workbench.export_carved_object(object_row=object_row, output_path=output_path)
 
     def clear_packets_by_source(self, source: str) -> int:
         src = str(source or "").strip()
@@ -798,6 +1148,8 @@ class AppRuntime:
         c.execute("DELETE FROM alerts WHERE source=?", (src,))
         deleted = int(c.rowcount or 0)
         self.db.conn.commit()
+        if deleted > 0:
+            self.db.rebuild_flow_risk_summary(source=src, commit=True)
         return deleted
 
     def clear_offline_analysis_data(self, clear_alerts: bool = True) -> tuple[int, int]:
@@ -819,63 +1171,28 @@ class AppRuntime:
         return deleted_packets, deleted_alerts
 
     def import_offline_pcap(self, pcap_path: Path, mode: str = "") -> tuple[int, int]:
-        total_file_bytes = int(os.path.getsize(pcap_path)) if pcap_path.exists() else 0
-        profile = self.get_offline_import_profile(mode)
-        self._offline_cpu_last_sample = 0.0
-        self.clear_offline_analysis_data(clear_alerts=bool(profile.enable_detection))
-        self._begin_offline_write_mode(profile)
-        start_alert_id = self._current_alert_max_id()
-        learning_until_backup = float(getattr(self.detector, "learning_until", 0.0))
-        if self.detector.in_learning():
-            self.detector.learning_until = 0.0
-        self.offline_progress = {
-            "running": True,
-            "processed": 0,
-            "alerts": 0,
-            "file": str(pcap_path),
-            "percent": 0.0,
-            "bytes": 0,
-            "total_bytes": total_file_bytes,
-            "mode": profile.mode,
-            "parser_threads": profile.parser_threads,
-            "cpu_limit_percent": profile.cpu_limit_percent,
-        }
-        total_packets = 0
-        total_alerts = 0
+        return run_offline_import(self, pcap_path, mode)
+
+    def _import_offline_generic_frames(self, pcap_path: Path, parser_cfg: OfflineParserConfig, profile: OfflineImportProfile) -> int:
+        if not self._offline_store_enabled():
+            return 0
+        assert self.offline_packet_store is not None
+        total_frames = 0
         try:
-            parser_cfg = OfflineParserConfig(
-                batch_size=profile.batch_size,
-                raw_hex_preview_bytes=profile.raw_hex_preview_bytes,
-                prefer_native=True,
-                fallback_to_scapy=False,
-                enable_app_meta=profile.enable_app_meta,
-                worker_threads=profile.parser_threads,
-            )
-            for packet_batch in iter_offline_batches(pcap_path, parser_cfg):
-                batch = packet_batch.packets
-                alerts = self._process_offline_batch(batch, profile)
-                self._apply_offline_cpu_limit(profile)
-                total_packets += len(batch)
-                total_alerts += alerts
-                self.offline_progress["processed"] = total_packets
-                self.offline_progress["alerts"] = total_alerts
-                current_bytes = int(packet_batch.bytes_read or 0)
-                self.offline_progress["bytes"] = current_bytes
-                if total_file_bytes > 0:
-                    self.offline_progress["percent"] = min(100.0, (current_bytes / total_file_bytes) * 100.0)
-            total_alerts += self._flush_remaining_offline_features()
-            total_alerts += self._flush_offline_feature_buffer(force=True)
-            self.offline_progress["bytes"] = total_file_bytes
-            self.offline_progress["percent"] = 100.0
-            final_alerts = max(total_alerts, self._count_new_alerts(start_alert_id, source="offline"))
-            self.offline_progress["alerts"] = final_alerts
-            return total_packets, final_alerts
-        except OfflineParserError as e:
-            raise RuntimeError(str(e)) from e
-        finally:
-            self._end_offline_write_mode()
-            self.detector.learning_until = learning_until_backup
-            self.offline_progress["running"] = False
+            for frame_batch in iter_offline_generic_frames(pcap_path, parser_cfg):
+                frames = list(frame_batch.frames)
+                if not frames:
+                    continue
+                self.offline_packet_store.insert_frame_batch(
+                    frames=frames,
+                    preview_bytes=profile.raw_hex_preview_bytes,
+                    source="offline",
+                )
+                total_frames += len(frames)
+                self.offline_progress["generic_frames"] = total_frames
+        except OfflineParserError:
+            return total_frames
+        return total_frames
 
     def _apply_offline_cpu_limit(self, profile: OfflineImportProfile) -> None:
         limit = int(profile.cpu_limit_percent or 0)
@@ -1061,10 +1378,27 @@ class AppRuntime:
                     writer.writerow({k: row.get(k, "") for k in fields})
             return output_path
         if fmt == "pcap":
-            from scapy.all import ICMP, IP, TCP, UDP, wrpcap
+            from scapy.all import Ether, ICMP, IP, Raw, TCP, UDP, wrpcap
 
             packets = []
             for row in rows:
+                raw_hex = str(row.get("raw_hex", "") or "").strip()
+                if raw_hex:
+                    try:
+                        raw_bytes = bytes.fromhex(raw_hex)
+                    except Exception:
+                        raw_bytes = b""
+                    if raw_bytes:
+                        try:
+                            packets.append(Ether(raw_bytes))
+                            continue
+                        except Exception:
+                            try:
+                                packets.append(IP(raw_bytes))
+                                continue
+                            except Exception:
+                                packets.append(Raw(raw_bytes))
+                                continue
                 src_ip = str(row.get("src_ip", "") or "0.0.0.0")
                 dst_ip = str(row.get("dst_ip", "") or "0.0.0.0")
                 proto = str(row.get("proto", "OTHER")).upper()
@@ -1082,6 +1416,52 @@ class AppRuntime:
                 output_path.write_bytes(b"")
             return output_path
         raise ValueError("不支持的导出格式")
+
+    def expand_packet_rows(self, rows: Sequence[dict], detail_batch_size: int = 400) -> list[dict]:
+        if not rows:
+            return []
+        base_by_id = {int(row.get("id", 0) or 0): dict(row) for row in rows if int(row.get("id", 0) or 0) > 0}
+        packet_ids = list(base_by_id.keys())
+        expanded: list[dict] = []
+        batch_size = max(50, min(800, int(detail_batch_size or 400)))
+        for offset in range(0, len(packet_ids), batch_size):
+            batch = packet_ids[offset : offset + batch_size]
+            detail_map = self.query_packet_details(batch, include_related_alerts=False)
+            for packet_id in batch:
+                detail = dict(detail_map.get(packet_id) or {})
+                if not detail:
+                    detail = dict(base_by_id.get(packet_id, {}))
+                base = base_by_id.get(packet_id, {})
+                if "risk_level" not in detail:
+                    detail["risk_level"] = base.get("risk_level", "normal")
+                if "source" not in detail:
+                    detail["source"] = base.get("source", "")
+                expanded.append(detail)
+        return expanded
+
+    def extract_packet_fields(self, rows: Sequence[dict], detail_batch_size: int = 400) -> list[dict]:
+        return self.packet_batch_export.extract_field_rows(self.expand_packet_rows(rows, detail_batch_size=detail_batch_size))
+
+    def export_packet_fields(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
+        return self.packet_batch_export.export_field_rows(rows, output_path, file_format)
+
+    def extract_packet_flows(self, rows: Sequence[dict], detail_batch_size: int = 400) -> list[dict]:
+        return self.packet_batch_export.extract_flow_rows(self.expand_packet_rows(rows, detail_batch_size=detail_batch_size))
+
+    def export_packet_flows(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
+        return self.packet_batch_export.export_flow_rows(rows, output_path, file_format)
+
+    def extract_packet_candidates(self, rows: Sequence[dict], detail_batch_size: int = 400) -> list[dict]:
+        return self.packet_batch_export.extract_candidate_rows(self.expand_packet_rows(rows, detail_batch_size=detail_batch_size))
+
+    def export_packet_candidates(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
+        return self.packet_batch_export.export_candidate_rows(rows, output_path, file_format)
+
+    def export_packet_flow_body_bundle(self, rows: Sequence[dict], output_dir: Path, detail_batch_size: int = 400) -> Path:
+        return self.packet_batch_export.export_flow_body_bundle(
+            self.expand_packet_rows(rows, detail_batch_size=detail_batch_size),
+            output_dir=output_dir,
+        )
 
     def get_alert_breakdown(self, source: str = "") -> dict:
         c = self.db.conn.cursor()
@@ -1176,8 +1556,8 @@ class AppRuntime:
 
     @staticmethod
     def _run_netsh(args: list[str]) -> tuple[bool, str]:
-        res = subprocess.run(["netsh", *args], capture_output=True, text=True, check=False)
-        output = (res.stderr or res.stdout or "").strip()
+        res, stdout_text, stderr_text = run_command_capture(["netsh", *args])
+        output = (stderr_text or stdout_text or "").strip()
         return res.returncode == 0, output
 
     def _ensure_firewall_block_rules(self, ip: str) -> tuple[bool, str]:

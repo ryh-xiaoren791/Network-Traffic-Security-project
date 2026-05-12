@@ -11,8 +11,12 @@ class ReportService:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def generate_visual_report(self, source: str, output_path: Path | None = None) -> Path:
-        report_source = "offline" if str(source or "").strip().lower() == "offline" else "live"
+    def generate_visual_report(self, source: str | Path = "live", output_path: Path | None = None) -> Path:
+        if isinstance(source, Path):
+            output_path = source
+            report_source = "live"
+        else:
+            report_source = "offline" if str(source or "").strip().lower() == "offline" else "live"
         suffix = "traffic" if report_source == "offline" else "realtime"
         report_path = output_path or Path("reports") / f"security_report_{suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -26,21 +30,25 @@ class ReportService:
 
     def _query_summary(self, source: str) -> dict:
         c = self.db.conn.cursor()
-        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE source=?", (source,))
-        total_alerts = int(c.fetchone()["cnt"])
-        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE source=? AND level='high'", (source,))
-        high_alerts = int(c.fetchone()["cnt"])
-        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE source=? AND sub_category='隐私追踪拦截'", (source,))
-        privacy_blocks = int(c.fetchone()["cnt"])
-        c.execute("SELECT COUNT(*) AS cnt FROM alerts WHERE source=? AND ts >= datetime('now', '-24 hours')", (source,))
-        recent_alerts = int(c.fetchone()["cnt"])
+        c.execute(
+            """
+            SELECT
+                COALESCE(SUM(CASE WHEN source=? THEN 1 ELSE 0 END), 0) AS total_alerts,
+                COALESCE(SUM(CASE WHEN source=? AND level='high' THEN 1 ELSE 0 END), 0) AS high_alerts,
+                COALESCE(SUM(CASE WHEN source=? AND sub_category='隐私追踪拦截' THEN 1 ELSE 0 END), 0) AS privacy_blocks,
+                COALESCE(SUM(CASE WHEN source=? AND ts >= datetime('now', '-24 hours') THEN 1 ELSE 0 END), 0) AS recent_alerts
+            FROM alerts
+            """,
+            (source, source, source, source),
+        )
+        alert_summary = dict(c.fetchone() or {})
         c.execute("SELECT COUNT(*) AS cnt FROM blacklist_whitelist WHERE list_type='black' AND enabled=1")
-        black_items = int(c.fetchone()["cnt"])
+        black_items = int((c.fetchone() or {"cnt": 0})["cnt"])
         return {
-            "total_alerts": total_alerts,
-            "high_alerts": high_alerts,
-            "privacy_blocks": privacy_blocks,
-            "recent_alerts": recent_alerts,
+            "total_alerts": int(alert_summary.get("total_alerts") or 0),
+            "high_alerts": int(alert_summary.get("high_alerts") or 0),
+            "privacy_blocks": int(alert_summary.get("privacy_blocks") or 0),
+            "recent_alerts": int(alert_summary.get("recent_alerts") or 0),
             "black_items": black_items,
         }
 
@@ -88,7 +96,8 @@ class ReportService:
         level_pairs: list[tuple[str, int]],
         top_ip_pairs: list[tuple[str, int]],
     ) -> str:
-        report_name = "流量分析报告" if source == "offline" else "实时监测报告"
+        report_suffix = "Traffic Analysis" if source == "offline" else "Realtime Monitoring"
+        report_name = f"Device Security Analysis Report - {report_suffix}"
         trend_svg = self._line_chart_svg(trend_points, "Inbound Traffic Trend")
         level_svg = self._bar_chart_svg(level_pairs, "Alert Level Distribution")
         top_ip_svg = self._bar_chart_svg(top_ip_pairs, "Top Abnormal Source IPs")

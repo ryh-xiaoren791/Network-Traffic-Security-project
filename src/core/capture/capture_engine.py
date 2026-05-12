@@ -2,12 +2,13 @@ import ipaddress
 import platform
 import queue
 import socket
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
 
 import psutil
+
+from src.subprocess_utils import run_command_capture
 
 
 @dataclass
@@ -238,16 +239,12 @@ class CaptureEngine:
         now = time.time()
         if now - self._conn_cache_ts < 1.0:
             return
-        try:
-            import psutil
-        except Exception:
-            self._conn_cache_ts = now
-            return
         proto_map = {
             socket.SOCK_STREAM: "TCP",
             socket.SOCK_DGRAM: "UDP",
         }
         cache: dict[tuple[str, str, int, str, int], tuple[int, str]] = {}
+        pid_name_cache: dict[int, str] = {}
         try:
             conns = psutil.net_connections(kind="inet")
             for c in conns:
@@ -259,12 +256,13 @@ class CaptureEngine:
                 laddr = c.laddr
                 raddr = c.raddr
                 pid = int(c.pid or 0)
-                pname = ""
-                if pid > 0:
+                pname = pid_name_cache.get(pid, "")
+                if pid > 0 and pid not in pid_name_cache:
                     try:
                         pname = psutil.Process(pid).name()
                     except Exception:
                         pname = ""
+                    pid_name_cache[pid] = pname
                 key = (proto, str(laddr.ip), int(laddr.port), str(raddr.ip), int(raddr.port))
                 cache[key] = (pid, pname)
         except Exception:
@@ -342,9 +340,15 @@ class CaptureEngine:
         self.capture_loopback = False
         self.interface_networks = []
         self.interface_index = 0
+        thread = self.thread
+        self.thread = None
         divert = self._divert
         self._divert = None
         self._safe_close_divert(divert)
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+        self._conn_cache = {}
+        self._conn_cache_ts = 0.0
 
     @staticmethod
     def set_interface_enabled(interface_name: str, enabled: bool) -> tuple[bool, str]:
@@ -355,15 +359,12 @@ class CaptureEngine:
             return False, "仅支持Windows系统"
         state = "enabled" if enabled else "disabled"
         try:
-            result = subprocess.run(
-                ["netsh", "interface", "set", "interface", f'name="{name}"', f"admin={state}"],
-                capture_output=True,
-                text=True,
-                check=False,
+            result, stdout_text, stderr_text = run_command_capture(
+                ["netsh", "interface", "set", "interface", f'name="{name}"', f"admin={state}"]
             )
             if result.returncode == 0:
                 return True, "操作成功"
-            msg = (result.stderr or result.stdout or "").strip()
+            msg = (stderr_text or stdout_text or "").strip()
             if not msg:
                 msg = "操作失败，请以管理员权限运行"
             return False, msg

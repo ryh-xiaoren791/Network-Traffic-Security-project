@@ -17,6 +17,21 @@ from src.app.runtime import AppRuntime
 from src.core.offline.adapter import OfflineParserConfig, iter_offline_batches
 
 
+def _profile_to_dict(runtime: AppRuntime, mode: str) -> dict:
+    profile = runtime.get_offline_import_profile(mode)
+    return {
+        "mode": profile.mode,
+        "batch_size": profile.batch_size,
+        "parser_threads": profile.parser_threads,
+        "cpu_limit_percent": profile.cpu_limit_percent,
+        "raw_hex_preview_bytes": profile.raw_hex_preview_bytes,
+        "store_packets": profile.store_packets,
+        "store_raw_hex": profile.store_raw_hex,
+        "enable_app_meta": profile.enable_app_meta,
+        "enable_detection": profile.enable_detection,
+    }
+
+
 def _run_with_metrics(runner) -> tuple[dict, float, float]:
     proc = psutil.Process()
     stop_flag = {"stop": False}
@@ -74,16 +89,19 @@ def benchmark_parse_only(pcap_path: Path, batch_size: int, raw_hex_preview_bytes
 def benchmark_full_pipeline(pcap_path: Path, mode: str) -> dict:
     def run() -> dict:
         runtime = AppRuntime()
-        begin = time.perf_counter()
-        packets, alerts = runtime.import_offline_pcap(pcap_path, mode=mode)
-        sec = max(1e-9, time.perf_counter() - begin)
-        return {
-            "mode": f"full_pipeline_{mode}",
-            "packets": packets,
-            "alerts": alerts,
-            "seconds": round(sec, 6),
-            "pps": round(packets / sec, 2),
-        }
+        try:
+            begin = time.perf_counter()
+            packets, alerts = runtime.import_offline_pcap(pcap_path, mode=mode)
+            sec = max(1e-9, time.perf_counter() - begin)
+            return {
+                "mode": f"full_pipeline_{mode}",
+                "packets": packets,
+                "alerts": alerts,
+                "seconds": round(sec, 6),
+                "pps": round(packets / sec, 2),
+            }
+        finally:
+            runtime.close()
 
     result, peak_rss_mb, cpu_peak = _run_with_metrics(run)
     result["peak_rss_mb"] = peak_rss_mb
@@ -101,30 +119,23 @@ def main() -> None:
     if not p.exists():
         raise FileNotFoundError(f"pcap not found: {p}")
     runtime = AppRuntime()
-    profile = runtime.get_offline_import_profile(args.mode)
-    result = {
-        "file": str(p),
-        "bytes": p.stat().st_size,
-        "profile": {
-            "mode": profile.mode,
-            "batch_size": profile.batch_size,
-            "parser_threads": profile.parser_threads,
-            "cpu_limit_percent": profile.cpu_limit_percent,
-            "raw_hex_preview_bytes": profile.raw_hex_preview_bytes,
-            "store_packets": profile.store_packets,
-            "store_raw_hex": profile.store_raw_hex,
-            "enable_app_meta": profile.enable_app_meta,
-            "enable_detection": profile.enable_detection,
-        },
-        "parse": benchmark_parse_only(
-            p,
-            max(1000, int(args.batch_size)),
-            profile.raw_hex_preview_bytes,
-            profile.enable_app_meta,
-        ),
-        "pipeline": benchmark_full_pipeline(p, profile.mode),
-    }
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    try:
+        profile = runtime.get_offline_import_profile(args.mode)
+        result = {
+            "file": str(p),
+            "bytes": p.stat().st_size,
+            "profile": _profile_to_dict(runtime, args.mode),
+            "parse": benchmark_parse_only(
+                p,
+                max(1000, int(args.batch_size)),
+                profile.raw_hex_preview_bytes,
+                profile.enable_app_meta,
+            ),
+            "pipeline": benchmark_full_pipeline(p, profile.mode),
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    finally:
+        runtime.close()
 
 
 if __name__ == "__main__":

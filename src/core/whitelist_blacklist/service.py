@@ -1,5 +1,8 @@
 import ipaddress
 import socket
+import threading
+import time
+from queue import Empty, Queue
 
 from src.core.storage.db import Database, now_text
 
@@ -8,6 +11,12 @@ class ListService:
     def __init__(self, db: Database) -> None:
         self.db = db
         self._dns_cache: dict[str, str] = {}
+        self._dns_pending: set[str] = set()
+        self._dns_queue: Queue[str] = Queue(maxsize=2048)
+        self._dns_cache_limit = 4096
+        self._dns_stop_event = threading.Event()
+        self._dns_worker = threading.Thread(target=self._dns_resolve_loop, daemon=True)
+        self._dns_worker.start()
         self.privacy_tracker_keywords = (
             "doubleclick",
             "google-analytics",
@@ -87,17 +96,66 @@ class ListService:
     def _resolve_host(self, ip: str) -> str:
         if ip in self._dns_cache:
             return self._dns_cache[ip]
+        if not self._should_resolve_ip(ip):
+            self._remember_dns(ip, "")
+            return ""
+        self._schedule_host_resolve(ip)
+        return ""
+
+    @staticmethod
+    def _should_resolve_ip(ip: str) -> bool:
         try:
             parsed = ipaddress.ip_address(ip)
             if parsed.is_private or parsed.is_loopback or parsed.is_reserved or parsed.is_multicast:
-                self._dns_cache[ip] = ""
-                return ""
+                return False
         except ValueError:
-            self._dns_cache[ip] = ""
-            return ""
+            return False
+        return True
+
+    def _schedule_host_resolve(self, ip: str) -> None:
+        if ip in self._dns_pending or ip in self._dns_cache:
+            return
+        self._dns_pending.add(ip)
         try:
-            host, _, _ = socket.gethostbyaddr(ip)
+            self._dns_queue.put_nowait(ip)
         except Exception:
-            host = ""
+            self._dns_pending.discard(ip)
+
+    def _remember_dns(self, ip: str, host: str) -> None:
+        if ip in self._dns_cache:
+            self._dns_cache.pop(ip, None)
+        elif len(self._dns_cache) >= self._dns_cache_limit:
+            oldest_ip = next(iter(self._dns_cache), None)
+            if oldest_ip is not None:
+                self._dns_cache.pop(oldest_ip, None)
         self._dns_cache[ip] = host
-        return host
+
+    def _dns_resolve_loop(self) -> None:
+        while not self._dns_stop_event.is_set():
+            try:
+                ip = self._dns_queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if ip == "__stop__":
+                self._dns_pending.discard(ip)
+                self._dns_queue.task_done()
+                break
+            host = ""
+            try:
+                host, _, _ = socket.gethostbyaddr(ip)
+            except Exception:
+                host = ""
+            self._remember_dns(ip, host)
+            self._dns_pending.discard(ip)
+            self._dns_queue.task_done()
+            time.sleep(0.01)
+
+    def close(self) -> None:
+        self._dns_stop_event.set()
+        try:
+            self._dns_queue.put_nowait("__stop__")
+        except Exception:
+            pass
+        if self._dns_worker.is_alive():
+            self._dns_worker.join(timeout=1.0)
+        self._dns_pending.clear()

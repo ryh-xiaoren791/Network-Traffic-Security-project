@@ -1,4 +1,4 @@
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 import ipaddress
 
@@ -34,10 +34,13 @@ class SessionAggregator:
     def __init__(self) -> None:
         self.sessions: dict[str, SessionStat] = {}
         self.dirty_sessions: set[str] = set()
-        self.src_port_windows = defaultdict(set)
-        self.recent_sessions = defaultdict(list)
-        self.internal_targets = defaultdict(set)
-        self.sensitive_port_hits = defaultdict(int)
+        self.src_port_windows = defaultdict(dict)
+        self.recent_sessions = defaultdict(deque)
+        self.internal_targets = defaultdict(dict)
+        self.sensitive_port_hits = defaultdict(deque)
+        self.src_last_seen: dict[str, float] = {}
+        self.recent_window_seconds = 5.0
+        self.source_retention_seconds = 60.0
 
     @staticmethod
     def _key(pkt: dict) -> str:
@@ -100,12 +103,13 @@ class SessionAggregator:
             src_ip = str(pkt["src_ip"])
             dst_ip = str(pkt["dst_ip"])
             dst_port = int(pkt["dst_port"])
-            self.src_port_windows[src_ip].add(dst_port)
-            self.recent_sessions[src_ip].append(now)
+            self.src_last_seen[src_ip] = float(now)
+            self.src_port_windows[src_ip][dst_port] = float(now)
+            self.recent_sessions[src_ip].append(float(now))
             if self._is_private_ip(dst_ip):
-                self.internal_targets[src_ip].add(dst_ip)
+                self.internal_targets[src_ip][dst_ip] = float(now)
             if self._is_sensitive_port(dst_port):
-                self.sensitive_port_hits[src_ip] += 1
+                self.sensitive_port_hits[src_ip].append(float(now))
 
     @staticmethod
     def _flags_from_mask(mask: int) -> set[str]:
@@ -129,10 +133,12 @@ class SessionAggregator:
         return self._extract_flags_and_payload(str(pkt.get("raw_hex", "")))
 
     def cleanup_expired(self, now_ts: float, timeout_sec: int = 60) -> int:
+        self.source_retention_seconds = max(self.recent_window_seconds, float(timeout_sec))
         expired = [k for k, s in self.sessions.items() if now_ts - s.last_ts > timeout_sec]
         for key in expired:
             self.sessions.pop(key, None)
             self.dirty_sessions.discard(key)
+        self._cleanup_source_windows(now_ts, timeout_sec)
         return len(expired)
 
     def flush_features(self, now_ts: float, only_dirty: bool = True) -> list[dict]:
@@ -142,14 +148,15 @@ class SessionAggregator:
             s = self.sessions.get(key)
             if s is None:
                 continue
+            self._prune_src_windows(s.src_ip, now_ts, self._source_retention_seconds())
             duration = max(0.001, s.last_ts - s.first_ts)
             packet_rate = s.packets / duration
             avg_pkt_size = s.total_bytes / max(1, s.packets)
             req_interval = float(np.mean(s.intervals)) if s.intervals else duration
             interval_std = float(np.std(s.intervals)) if s.intervals else 0.0
             port_visits = len(self.src_port_windows[s.src_ip])
-            recent = [t for t in self.recent_sessions[s.src_ip] if now_ts - t <= 5]
-            conn_freq = len(recent) / 5.0
+            recent = self.recent_sessions[s.src_ip]
+            conn_freq = len(recent) / self.recent_window_seconds
             success_rate = 1.0 if s.syn_count <= 0 else min(1.0, (s.syn_ack_count + s.ack_count) / max(1, s.syn_count * 2))
             syn_ratio = s.syn_count / max(1, s.packets)
             src_is_private = self._is_private_ip(s.src_ip)
@@ -188,7 +195,7 @@ class SessionAggregator:
                     "dst_port_type": dst_port_type,
                     "is_sensitive_port": is_sensitive_port,
                     "internal_target_count": len(self.internal_targets[s.src_ip]),
-                    "sensitive_port_hits": self.sensitive_port_hits[s.src_ip],
+                    "sensitive_port_hits": len(self.sensitive_port_hits[s.src_ip]),
                     "payload_preview": s.payload_preview,
                     "direction": s.direction,
                     "process_id": s.process_id,
@@ -198,6 +205,49 @@ class SessionAggregator:
         if only_dirty:
             self.dirty_sessions.clear()
         return features
+
+    def _source_retention_seconds(self) -> float:
+        return max(self.recent_window_seconds, self.source_retention_seconds)
+
+    def _prune_src_windows(self, src_ip: str, now_ts: float, timeout_sec: float) -> None:
+        cutoff = float(now_ts) - float(timeout_sec)
+        recent_cutoff = float(now_ts) - self.recent_window_seconds
+
+        port_window = self.src_port_windows.get(src_ip)
+        if port_window is not None:
+            stale_ports = [port for port, ts in port_window.items() if ts < cutoff]
+            for port in stale_ports:
+                port_window.pop(port, None)
+            if not port_window:
+                self.src_port_windows.pop(src_ip, None)
+
+        recent = self.recent_sessions.get(src_ip)
+        if recent is not None:
+            while recent and recent[0] < recent_cutoff:
+                recent.popleft()
+            if not recent:
+                self.recent_sessions.pop(src_ip, None)
+
+        internal_targets = self.internal_targets.get(src_ip)
+        if internal_targets is not None:
+            stale_targets = [target for target, ts in internal_targets.items() if ts < cutoff]
+            for target in stale_targets:
+                internal_targets.pop(target, None)
+            if not internal_targets:
+                self.internal_targets.pop(src_ip, None)
+
+        sensitive_hits = self.sensitive_port_hits.get(src_ip)
+        if sensitive_hits is not None:
+            while sensitive_hits and sensitive_hits[0] < cutoff:
+                sensitive_hits.popleft()
+            if not sensitive_hits:
+                self.sensitive_port_hits.pop(src_ip, None)
+
+    def _cleanup_source_windows(self, now_ts: float, timeout_sec: float) -> None:
+        stale_sources = [src_ip for src_ip, last_seen in self.src_last_seen.items() if now_ts - last_seen > timeout_sec]
+        for src_ip in stale_sources:
+            self._prune_src_windows(src_ip, now_ts, timeout_sec)
+            self.src_last_seen.pop(src_ip, None)
 
     @staticmethod
     def _extract_flags_and_payload(raw_hex: str) -> tuple[set[str], str]:

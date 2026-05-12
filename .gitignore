@@ -7,6 +7,8 @@ __pycache__/
 .env
 .env.*
 tests/
+test_results/
+docs/
 dist/
 exe/
 build/
@@ -14,9 +16,12 @@ native/traffic_core/build/
 *.pyd
 data/
 reports/
-docs/
 ppt/
 开题报告/
 .vscode/
 .trae/
 data/system.db
+.coverage
+.coveragerc
+pytest.ini
+requirements-test.txt

@@ -6,6 +6,7 @@ from pathlib import Path
 
 class OfflinePacketStore:
     OFFLINE_ID_BASE = 10_000_000_000
+    OFFLINE_FRAME_ID_BASE = 20_000_000_000
 
     def __init__(self, db_path: Path) -> None:
         import duckdb
@@ -44,6 +45,28 @@ class OfflinePacketStore:
             );
             """
         )
+        self.conn.execute(
+            """
+            CREATE SEQUENCE IF NOT EXISTS offline_frames_id_seq START 1;
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS offline_frames (
+                id BIGINT DEFAULT nextval('offline_frames_id_seq'),
+                frame_no BIGINT,
+                ts DOUBLE,
+                linktype INTEGER,
+                iface VARCHAR,
+                frame_type VARCHAR,
+                caplen INTEGER,
+                wirelen INTEGER,
+                summary VARCHAR,
+                raw_hex VARCHAR,
+                source VARCHAR
+            );
+            """
+        )
         self._ensure_indexes()
 
     def _ensure_indexes(self) -> None:
@@ -53,6 +76,8 @@ class OfflinePacketStore:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_packets_src_ip ON offline_packets(src_ip);")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_packets_dst_ip ON offline_packets(dst_ip);")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_packets_proto ON offline_packets(proto);")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_frames_source_id ON offline_frames(source, id);")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_offline_frames_linktype ON offline_frames(linktype);")
 
     @classmethod
     def _encode_id(cls, real_id: int) -> int:
@@ -65,14 +90,28 @@ class OfflinePacketStore:
             return value - cls.OFFLINE_ID_BASE
         return -1
 
+    @classmethod
+    def _encode_frame_id(cls, real_id: int) -> int:
+        return int(real_id) + cls.OFFLINE_FRAME_ID_BASE
+
+    @classmethod
+    def _decode_frame_id(cls, frame_id: int) -> int:
+        value = int(frame_id)
+        if value >= cls.OFFLINE_FRAME_ID_BASE:
+            return value - cls.OFFLINE_FRAME_ID_BASE
+        return -1
+
     def clear_source(self, source: str = "offline") -> int:
         if source == "offline":
             self.conn.execute("DROP TABLE IF EXISTS offline_packets")
             self.conn.execute("DROP SEQUENCE IF EXISTS offline_packets_id_seq")
+            self.conn.execute("DROP TABLE IF EXISTS offline_frames")
+            self.conn.execute("DROP SEQUENCE IF EXISTS offline_frames_id_seq")
             self._init_schema()
             return 0
         before = self.conn.execute("SELECT COUNT(*) FROM offline_packets WHERE source = ?", [source]).fetchone()[0]
         self.conn.execute("DELETE FROM offline_packets WHERE source = ?", [source])
+        self.conn.execute("DELETE FROM offline_frames WHERE source = ?", [source])
         return int(before or 0)
 
     def begin_bulk(self) -> None:
@@ -83,6 +122,8 @@ class OfflinePacketStore:
         self.conn.execute("DROP INDEX IF EXISTS idx_offline_packets_src_ip")
         self.conn.execute("DROP INDEX IF EXISTS idx_offline_packets_dst_ip")
         self.conn.execute("DROP INDEX IF EXISTS idx_offline_packets_proto")
+        self.conn.execute("DROP INDEX IF EXISTS idx_offline_frames_source_id")
+        self.conn.execute("DROP INDEX IF EXISTS idx_offline_frames_linktype")
         self.conn.execute("BEGIN TRANSACTION")
         self._in_bulk = True
 
@@ -206,15 +247,60 @@ class OfflinePacketStore:
         )
         self.conn.unregister("_packet_batch_arrow")
 
+    def insert_frame_batch(self, frames: list[dict], preview_bytes: int, source: str = "offline") -> None:
+        if not frames:
+            return
+        import pyarrow as pa
+
+        max_hex = max(0, int(preview_bytes)) * 2
+        cols = {
+            "frame_no": [],
+            "ts": [],
+            "linktype": [],
+            "iface": [],
+            "frame_type": [],
+            "caplen": [],
+            "wirelen": [],
+            "summary": [],
+            "raw_hex": [],
+            "source": [],
+        }
+        for row in frames:
+            cols["frame_no"].append(int(row.get("frame_no", 0) or 0))
+            cols["ts"].append(float(row.get("ts", 0.0) or 0.0))
+            cols["linktype"].append(int(row.get("linktype", 0) or 0))
+            cols["iface"].append(str(row.get("iface", "") or ""))
+            cols["frame_type"].append(str(row.get("frame_type", "") or "unknown"))
+            cols["caplen"].append(int(row.get("caplen", 0) or 0))
+            cols["wirelen"].append(int(row.get("wirelen", 0) or 0))
+            cols["summary"].append(str(row.get("summary", "") or "")[:260])
+            raw_hex = str(row.get("raw_hex", "") or "")
+            cols["raw_hex"].append(raw_hex[:max_hex] if max_hex > 0 else raw_hex)
+            cols["source"].append(str(row.get("source", source) or source))
+        table = pa.table(cols)
+        self.conn.register("_frame_batch_arrow", table)
+        self.conn.execute(
+            """
+            INSERT INTO offline_frames(frame_no, ts, linktype, iface, frame_type, caplen, wirelen, summary, raw_hex, source)
+            SELECT frame_no, ts, linktype, iface, frame_type, caplen, wirelen, summary, raw_hex, source
+            FROM _frame_batch_arrow
+            """
+        )
+        self.conn.unregister("_frame_batch_arrow")
+
     def query_packets(
         self,
         limit: int | None,
+        offset: int = 0,
         process_name: str = "",
         ip: str = "",
         source: str = "offline",
         extra_sql: str = "",
         extra_args: list | None = None,
+        sort_key: str = "ts",
+        sort_desc: bool = True,
     ) -> list[dict]:
+        sort_field = self._build_packet_sort_sql(sort_key, sort_desc)
         sql = """
             SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, direction, process_id, process_name, source
             FROM offline_packets
@@ -234,10 +320,10 @@ class OfflinePacketStore:
             sql += extra_sql
             if extra_args:
                 args.extend(extra_args)
-        sql += " ORDER BY id DESC"
+        sql += f" ORDER BY {sort_field}"
         if limit is not None and int(limit) > 0:
-            sql += " LIMIT ?"
-            args.append(int(limit))
+            sql += " LIMIT ? OFFSET ?"
+            args.extend([int(limit), max(0, int(offset))])
         rows = self.conn.execute(sql, args).fetchall()
         cols = ["id", "ts", "src_ip", "dst_ip", "src_port", "dst_port", "proto", "length", "direction", "process_id", "process_name", "source"]
         out = [dict(zip(cols, row)) for row in rows]
@@ -245,8 +331,116 @@ class OfflinePacketStore:
             row["id"] = self._encode_id(int(row["id"] or 0))
         return out
 
+    def count_packets(
+        self,
+        process_name: str = "",
+        ip: str = "",
+        source: str = "offline",
+        extra_sql: str = "",
+        extra_args: list | None = None,
+    ) -> int:
+        sql = """
+            SELECT COUNT(1)
+            FROM offline_packets
+            WHERE 1=1
+        """
+        args: list = []
+        if source:
+            sql += " AND source = ?"
+            args.append(source)
+        if process_name:
+            sql += " AND process_name LIKE ?"
+            args.append(f"%{process_name}%")
+        if ip:
+            sql += " AND (src_ip LIKE ? OR dst_ip LIKE ?)"
+            args.extend([f"%{ip}%", f"%{ip}%"])
+        if extra_sql:
+            sql += extra_sql
+            if extra_args:
+                args.extend(extra_args)
+        row = self.conn.execute(sql, args).fetchone()
+        return int(row[0] if row else 0)
+
+    def query_frames(
+        self,
+        limit: int | None,
+        offset: int = 0,
+        source: str = "offline",
+        search_text: str = "",
+        linktype: int = 0,
+    ) -> list[dict]:
+        sql = """
+            SELECT id, frame_no, ts, linktype, iface, frame_type, caplen, wirelen, summary, raw_hex, source
+            FROM offline_frames
+            WHERE 1=1
+        """
+        args: list = []
+        if source:
+            sql += " AND source = ?"
+            args.append(source)
+        if int(linktype or 0) > 0:
+            sql += " AND linktype = ?"
+            args.append(int(linktype))
+        if search_text:
+            sql += " AND (summary LIKE ? OR raw_hex LIKE ? OR iface LIKE ? OR frame_type LIKE ?)"
+            like = f"%{search_text}%"
+            args.extend([like, like, like, like])
+        sql += " ORDER BY ts ASC, id ASC"
+        if limit is not None and int(limit) > 0:
+            sql += " LIMIT ? OFFSET ?"
+            args.extend([int(limit), max(0, int(offset))])
+        rows = self.conn.execute(sql, args).fetchall()
+        cols = ["id", "frame_no", "ts", "linktype", "iface", "frame_type", "caplen", "wirelen", "summary", "raw_hex", "source"]
+        out = [dict(zip(cols, row)) for row in rows]
+        for row in out:
+            row["id"] = self._encode_frame_id(int(row["id"] or 0))
+        return out
+
+    def count_frames(self, source: str = "offline", search_text: str = "", linktype: int = 0) -> int:
+        sql = """
+            SELECT COUNT(1)
+            FROM offline_frames
+            WHERE 1=1
+        """
+        args: list = []
+        if source:
+            sql += " AND source = ?"
+            args.append(source)
+        if int(linktype or 0) > 0:
+            sql += " AND linktype = ?"
+            args.append(int(linktype))
+        if search_text:
+            sql += " AND (summary LIKE ? OR raw_hex LIKE ? OR iface LIKE ? OR frame_type LIKE ?)"
+            like = f"%{search_text}%"
+            args.extend([like, like, like, like])
+        row = self.conn.execute(sql, args).fetchone()
+        return int(row[0] if row else 0)
+
+    @staticmethod
+    def _build_packet_sort_sql(sort_key: str, sort_desc: bool) -> str:
+        key = str(sort_key or "").strip().lower()
+        direction = "DESC" if sort_desc else "ASC"
+        field_map = {
+            "ts": "ts",
+            "id": "id",
+            "process_name": "lower(process_name)",
+            "src_ip": "src_ip",
+            "dst_ip": "dst_ip",
+            "src_port": "src_port",
+            "dst_port": "dst_port",
+            "proto": "proto",
+            "length": "length",
+            "source": "source",
+        }
+        field_sql = field_map.get(key, "ts")
+        return f"{field_sql} {direction}, id {direction}"
+
     def query_packets_by_ids(self, packet_ids: list[int]) -> list[dict]:
-        ids = [self._decode_id(int(i)) for i in packet_ids if self._decode_id(int(i)) > 0]
+        ids: list[int] = []
+        for packet_id in packet_ids:
+            real_id = self._decode_id(int(packet_id))
+            if real_id > 0:
+                ids.append(real_id)
         if not ids:
             return []
         placeholders = ",".join(["?"] * len(ids))
@@ -267,7 +461,7 @@ class OfflinePacketStore:
         real_id = self._decode_id(packet_id)
         if real_id <= 0:
             return None
-        rows = self.conn.execute(
+        row = self.conn.execute(
             """
             SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, direction, process_id, process_name, raw_hex, source
             FROM offline_packets
@@ -275,54 +469,108 @@ class OfflinePacketStore:
             LIMIT 1
             """,
             [int(real_id)],
-        ).fetchall()
-        if not rows:
+        ).fetchone()
+        if row is None:
             return None
         cols = ["id", "ts", "src_ip", "dst_ip", "src_port", "dst_port", "proto", "length", "direction", "process_id", "process_name", "raw_hex", "source"]
-        out = dict(zip(cols, rows[0]))
+        out = dict(zip(cols, row))
         out["id"] = self._encode_id(int(out["id"] or 0))
         return out
 
-    def query_flow_packets(self, packet_id: int, limit: int = 3000) -> list[dict]:
-        detail = self.query_packet_detail(int(packet_id))
-        if not detail:
+    def query_packet_details(self, packet_ids: list[int]) -> list[dict]:
+        real_ids = [self._decode_id(int(packet_id)) for packet_id in packet_ids]
+        real_ids = [real_id for real_id in real_ids if real_id > 0]
+        if not real_ids:
             return []
-        src_ip = str(detail.get("src_ip", "") or "")
-        dst_ip = str(detail.get("dst_ip", "") or "")
-        src_port = int(detail.get("src_port", 0) or 0)
-        dst_port = int(detail.get("dst_port", 0) or 0)
-        proto = str(detail.get("proto", "") or "").upper()
-        source = str(detail.get("source", "offline") or "offline")
+        placeholders = ",".join(["?"] * len(real_ids))
+        rows = self.conn.execute(
+            f"""
+            SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, direction, process_id, process_name, raw_hex, source
+            FROM offline_packets
+            WHERE id IN ({placeholders})
+            ORDER BY id DESC
+            """,
+            real_ids,
+        ).fetchall()
+        cols = ["id", "ts", "src_ip", "dst_ip", "src_port", "dst_port", "proto", "length", "direction", "process_id", "process_name", "raw_hex", "source"]
+        out = [dict(zip(cols, row)) for row in rows]
+        for row in out:
+            row["id"] = self._encode_id(int(row["id"] or 0))
+        return out
+
+    def query_frame_detail(self, frame_id: int) -> dict | None:
+        real_id = self._decode_frame_id(frame_id)
+        if real_id <= 0:
+            return None
         rows = self.conn.execute(
             """
-            SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, process_name, raw_hex, source
-            FROM offline_packets
-            WHERE source = ?
-              AND proto = ?
-              AND (
-                (src_ip = ? AND dst_ip = ? AND src_port = ? AND dst_port = ?)
-                OR
-                (src_ip = ? AND dst_ip = ? AND src_port = ? AND dst_port = ?)
-              )
+            SELECT id, frame_no, ts, linktype, iface, frame_type, caplen, wirelen, summary, raw_hex, source
+            FROM offline_frames
+            WHERE id = ?
+            LIMIT 1
+            """,
+            [int(real_id)],
+        ).fetchall()
+        if not rows:
+            return None
+        cols = ["id", "frame_no", "ts", "linktype", "iface", "frame_type", "caplen", "wirelen", "summary", "raw_hex", "source"]
+        out = dict(zip(cols, rows[0]))
+        out["id"] = self._encode_frame_id(int(out["id"] or 0))
+        return out
+
+    def query_frame_details(self, frame_ids: list[int]) -> list[dict]:
+        real_ids = [self._decode_frame_id(int(frame_id)) for frame_id in frame_ids]
+        real_ids = [real_id for real_id in real_ids if real_id > 0]
+        if not real_ids:
+            return []
+        placeholders = ",".join(["?"] * len(real_ids))
+        rows = self.conn.execute(
+            f"""
+            SELECT id, frame_no, ts, linktype, iface, frame_type, caplen, wirelen, summary, raw_hex, source
+            FROM offline_frames
+            WHERE id IN ({placeholders})
+            ORDER BY id DESC
+            """,
+            real_ids,
+        ).fetchall()
+        cols = ["id", "frame_no", "ts", "linktype", "iface", "frame_type", "caplen", "wirelen", "summary", "raw_hex", "source"]
+        out = [dict(zip(cols, row)) for row in rows]
+        for row in out:
+            row["id"] = self._encode_frame_id(int(row["id"] or 0))
+        return out
+
+    def query_flow_packets(self, packet_id: int, limit: int = 3000) -> list[dict]:
+        real_id = self._decode_id(int(packet_id))
+        if real_id <= 0:
+            return []
+        rows = self.conn.execute(
+            """
+            WITH seed AS (
+                SELECT src_ip, dst_ip, src_port, dst_port, proto, source
+                FROM offline_packets
+                WHERE id = ?
+                LIMIT 1
+            )
+            SELECT p.id, p.ts, p.src_ip, p.dst_ip, p.src_port, p.dst_port, p.proto, p.length, p.process_name, p.raw_hex, p.source
+            FROM offline_packets AS p
+            INNER JOIN seed AS s
+                ON p.source = COALESCE(s.source, 'offline')
+               AND p.proto = UPPER(COALESCE(s.proto, ''))
+               AND (
+                    (p.src_ip = s.src_ip AND p.dst_ip = s.dst_ip AND p.src_port = s.src_port AND p.dst_port = s.dst_port)
+                    OR
+                    (p.src_ip = s.dst_ip AND p.dst_ip = s.src_ip AND p.src_port = s.dst_port AND p.dst_port = s.src_port)
+               )
             ORDER BY ts ASC, id ASC
             LIMIT ?
             """,
-            [
-                source,
-                proto,
-                src_ip,
-                dst_ip,
-                src_port,
-                dst_port,
-                dst_ip,
-                src_ip,
-                dst_port,
-                src_port,
-                max(1, int(limit)),
-            ],
+            [int(real_id), max(1, int(limit))],
         ).fetchall()
         cols = ["id", "ts", "src_ip", "dst_ip", "src_port", "dst_port", "proto", "length", "process_name", "raw_hex", "source"]
         out = [dict(zip(cols, row)) for row in rows]
         for row in out:
             row["id"] = self._encode_id(int(row["id"] or 0))
         return out
+
+    def close(self) -> None:
+        self.conn.close()

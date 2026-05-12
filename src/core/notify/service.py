@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import platform
-import subprocess
 import time
+
+from src.subprocess_utils import run_command_capture
 
 
 class NotificationService:
@@ -58,10 +59,7 @@ class NotificationService:
             "$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('AI-Traffic-Guard');"
             "$notifier.Show($toast);"
         )
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-            capture_output=True,
-            text=True,
-            check=False,
+        result, _, _ = run_command_capture(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
         )
         return result.returncode == 0

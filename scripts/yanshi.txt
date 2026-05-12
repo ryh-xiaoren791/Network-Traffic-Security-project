@@ -1,1 +1,0 @@
-powershell -ExecutionPolicy Bypass -File vm_demo_traffic.ps1 -TargetHost 192.168.197.1
