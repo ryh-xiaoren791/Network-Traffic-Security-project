@@ -123,7 +123,8 @@ def match_packet_term(row: Mapping[str, object], term: str, include_risk_text: b
     except Exception:
         expected_num = None
     values = _extract_compare_values(row, field)
-    comparator = lambda value: _compare_rule_value(value, op, expected_raw, expected_num)
+    def comparator(value):
+        return _compare_rule_value(value, op, expected_raw, expected_num)
     if op == "!=":
         return all(comparator(value) for value in values)
     return any(comparator(value) for value in values)

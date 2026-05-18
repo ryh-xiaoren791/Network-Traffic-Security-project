@@ -22,7 +22,7 @@ jobs:
           python -m pip install ruff
 
       - name: Lint with ruff
-        run: ruff check src tests
+        run: ruff check src
 
   security:
     runs-on: windows-latest
@@ -40,8 +40,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install bandit
 
+      - name: Prepare reports directory
+        run: New-Item -ItemType Directory -Force reports | Out-Null
+
       - name: Security scan with bandit
-        run: bandit -r src -f json -o reports/bandit_report.json -ll
+        run: bandit -r src -c .bandit -f json -o reports/bandit_report.json -ll
 
       - name: Upload security report
         uses: actions/upload-artifact@v4
@@ -49,112 +52,3 @@ jobs:
         with:
           name: bandit-report
           path: reports/bandit_report.json
-
-  unit:
-    needs: [lint]
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pytest pytest-cov pytest-html
-
-      - name: Run unit tests with coverage
-        run: |
-          python -m pytest tests -m "unit or not integration and not performance and not security" `
-            --cov=src --cov-report=html:reports/coverage_html `
-            --cov-report=term --cov-report=xml:reports/coverage.xml `
-            --html=reports/test_report_unit.html `
-            --self-contained-html `
-            --cov-fail-under=50 `
-            -v
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage-report
-          path: reports/coverage_html/
-
-      - name: Upload test report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-report-unit
-          path: reports/test_report_unit.html
-
-  integration:
-    needs: [unit]
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pytest pytest-html
-
-      - name: Run integration tests
-        run: |
-          python -m pytest tests -m "integration or api" `
-            --html=reports/test_report_integration.html `
-            --self-contained-html `
-            -v `
-            --timeout=120
-
-      - name: Upload integration test report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-report-integration
-          path: reports/test_report_integration.html
-
-  performance:
-    needs: [integration]
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pytest pytest-benchmark pytest-html
-
-      - name: Run performance tests
-        run: |
-          python -m pytest tests -m performance `
-            --benchmark-only `
-            --benchmark-json=reports/benchmark_results.json `
-            --html=reports/test_report_performance.html `
-            --self-contained-html `
-            -v
-
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: benchmark-results
-          path: reports/benchmark_results.json

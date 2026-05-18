@@ -2,7 +2,6 @@ import queue
 import re
 import sqlite3
 import socket
-import subprocess
 import threading
 import time
 import os
@@ -10,7 +9,6 @@ import ipaddress
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 try:
@@ -29,6 +27,7 @@ from src.config import CONFIG
 from src.core.aggregation.session_aggregator import SessionAggregator
 from src.core.audit.service import AuditService
 from src.core.capture.capture_engine import CaptureEngine
+from src.core.common import parse_ts_float, rank_to_level, render_ts_text
 from src.core.ctf import FlowWorkbenchService, PacketBatchExportService
 from src.core.detection.model_engine import ModelEngine
 from src.core.detection.rule_engine import RuleEngine
@@ -84,7 +83,6 @@ class AppRuntime:
         self.rule_engine = resolved.rule_engine or RuleEngine()
         self.detector = resolved.detector or DetectionService(self.db, self.list_service, self.model_engine, self.rule_engine)
         self.notifier = resolved.notifier or NotificationService()
-        self.report_service = resolved.report_service or ReportService(self.db)
         self.flow_workbench = resolved.flow_workbench or FlowWorkbenchService()
         self.packet_batch_export = resolved.packet_batch_export or PacketBatchExportService()
         self.offline_packet_store: OfflinePacketStore | None = resolved.offline_packet_store
@@ -93,6 +91,7 @@ class AppRuntime:
                 self.offline_packet_store = OfflinePacketStore(Path(getattr(CONFIG, "offline_duckdb_path", Path("data/offline_packets.duckdb"))))
             except Exception:
                 self.offline_packet_store = None
+        self.report_service = resolved.report_service or ReportService(self.db, offline_packet_store=self.offline_packet_store)
         self.packet_queue: queue.Queue = queue.Queue(maxsize=10000)
         self.capture = resolved.capture or CaptureEngine(self.packet_queue)
         self.aggregator = resolved.aggregator or SessionAggregator()
@@ -476,45 +475,6 @@ class AppRuntime:
         return rows
 
     @staticmethod
-    def _level_rank(level: str) -> int:
-        lv = (level or "").lower()
-        if lv == "high":
-            return 3
-        if lv == "medium":
-            return 2
-        if lv == "low":
-            return 1
-        return 0
-
-    @staticmethod
-    def _rank_level(rank: int) -> str:
-        if rank >= 3:
-            return "high"
-        if rank == 2:
-            return "medium"
-        if rank == 1:
-            return "low"
-        return "normal"
-
-    @staticmethod
-    def _render_ts_text(value: object) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        try:
-            ts = float(text)
-            return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return text
-
-    @staticmethod
-    def _parse_ts_float(value: object) -> float:
-        try:
-            return float(value or 0.0)
-        except Exception:
-            return 0.0
-
-    @staticmethod
     def _build_packet_rule_sql(expression: str) -> tuple[str, list]:
         expr = str(expression or "").strip()
         if not expr or "||" in expr or "!" in expr:
@@ -646,27 +606,19 @@ class AppRuntime:
 
     def _normalize_packet_rows(self, rows: list[dict]) -> list[dict]:
         for row in rows:
-            row["ts_epoch"] = self._parse_ts_float(row.get("ts", 0.0))
-            row["ts"] = self._render_ts_text(row.get("ts", ""))
+            row["ts_epoch"] = parse_ts_float(row.get("ts", 0.0))
+            row["ts"] = render_ts_text(row.get("ts", ""))
         return rows
 
-    def _count_packet_rows(self, process_name: str = "", ip: str = "", source: str = "", extra_sql: str = "", extra_args: list | None = None) -> int:
-        args = list(extra_args or [])
-        if source == "offline" and self._offline_store_enabled():
-            assert self.offline_packet_store is not None
-            return self.offline_packet_store.count_packets(
-                process_name=process_name,
-                ip=ip,
-                source="offline",
-                extra_sql=extra_sql,
-                extra_args=args,
-            )
-        c = self.db.conn.cursor()
-        sql = """
-            SELECT COUNT(1)
-            FROM captured_packets
-            WHERE 1=1
-        """
+    def _build_packet_filter_sql(
+        self,
+        process_name: str = "",
+        ip: str = "",
+        source: str = "",
+        extra_sql: str = "",
+        extra_args: list | None = None,
+    ) -> tuple[str, list[object]]:
+        sql = ""
         query_args: list[object] = []
         if process_name:
             sql += " AND process_name LIKE ?"
@@ -681,7 +633,33 @@ class AppRuntime:
             sql += " AND source <> 'offline'"
         if extra_sql:
             sql += extra_sql
-            query_args.extend(args)
+            query_args.extend(list(extra_args or []))
+        return sql, query_args
+
+    def _count_packet_rows(self, process_name: str = "", ip: str = "", source: str = "", extra_sql: str = "", extra_args: list | None = None) -> int:
+        if source == "offline" and self._offline_store_enabled():
+            assert self.offline_packet_store is not None
+            return self.offline_packet_store.count_packets(
+                process_name=process_name,
+                ip=ip,
+                source="offline",
+                extra_sql=extra_sql,
+                extra_args=list(extra_args or []),
+            )
+        c = self.db.conn.cursor()
+        sql = """
+            SELECT COUNT(1)
+            FROM captured_packets
+            WHERE 1=1
+        """
+        filter_sql, query_args = self._build_packet_filter_sql(
+            process_name=process_name,
+            ip=ip,
+            source=source,
+            extra_sql=extra_sql,
+            extra_args=extra_args,
+        )
+        sql += filter_sql
         c.execute(sql, tuple(query_args))
         row = c.fetchone()
         return int(row[0] if row else 0)
@@ -699,7 +677,6 @@ class AppRuntime:
         sort_desc: bool = True,
     ) -> list[dict]:
         key = self._normalize_packet_sort_key(sort_key)
-        args = list(extra_args or [])
         if source == "offline" and self._offline_store_enabled():
             assert self.offline_packet_store is not None
             rows = self.offline_packet_store.query_packets(
@@ -709,7 +686,7 @@ class AppRuntime:
                 ip=ip,
                 source="offline",
                 extra_sql=extra_sql,
-                extra_args=args,
+                extra_args=list(extra_args or []),
                 sort_key=key,
                 sort_desc=sort_desc,
             )
@@ -720,21 +697,14 @@ class AppRuntime:
             FROM captured_packets
             WHERE 1=1
         """
-        query_args: list[object] = []
-        if process_name:
-            sql += " AND process_name LIKE ?"
-            query_args.append(f"%{process_name}%")
-        if ip:
-            sql += " AND (src_ip LIKE ? OR dst_ip LIKE ?)"
-            query_args.extend([f"%{ip}%", f"%{ip}%"])
-        if source:
-            sql += " AND source=?"
-            query_args.append(source)
-        elif self._offline_store_enabled():
-            sql += " AND source <> 'offline'"
-        if extra_sql:
-            sql += extra_sql
-            query_args.extend(args)
+        filter_sql, query_args = self._build_packet_filter_sql(
+            process_name=process_name,
+            ip=ip,
+            source=source,
+            extra_sql=extra_sql,
+            extra_args=extra_args,
+        )
+        sql += filter_sql
         sql += f" ORDER BY {self._build_packet_sort_sql(key, sort_desc)}"
         sql += " LIMIT ? OFFSET ?"
         query_args.extend([max(1, int(limit)), max(0, int(offset))])
@@ -825,21 +795,14 @@ class AppRuntime:
                 FROM captured_packets
                 WHERE 1=1
             """
-            args: list = []
-            if process_name:
-                sql += " AND process_name LIKE ?"
-                args.append(f"%{process_name}%")
-            if ip:
-                sql += " AND (src_ip LIKE ? OR dst_ip LIKE ?)"
-                args.extend([f"%{ip}%", f"%{ip}%"])
-            if source:
-                sql += " AND source=?"
-                args.append(source)
-            elif self._offline_store_enabled():
-                sql += " AND source <> 'offline'"
-            if extra_sql:
-                sql += extra_sql
-                args.extend(extra_args)
+            filter_sql, args = self._build_packet_filter_sql(
+                process_name=process_name,
+                ip=ip,
+                source=source,
+                extra_sql=extra_sql,
+                extra_args=extra_args,
+            )
+            sql += filter_sql
             sql += " ORDER BY id DESC"
             if limit is not None and int(limit) > 0:
                 sql += " LIMIT ?"
@@ -875,8 +838,7 @@ class AppRuntime:
             for row in rows:
                 row["risk_level"] = "normal"
             return rows
-        c.execute(
-            f"""
+        _sql = f"""
             WITH requested_flows(src_ip, dst_ip, src_port, dst_port, proto, source) AS (
                 VALUES {", ".join(value_rows)}
             )
@@ -889,9 +851,8 @@ class AppRuntime:
                AND summary.dst_port = requested.dst_port
                AND summary.proto = requested.proto
                AND summary.source = requested.source
-            """,
-            tuple(args),
-        )
+            """
+        c.execute(_sql, tuple(args))
         for summary_row in c.fetchall():
             key = (
                 str(summary_row["src_ip"] or ""),
@@ -910,8 +871,25 @@ class AppRuntime:
             proto = str(row.get("proto", "") or "").upper()
             source = str(row.get("source", "live") or "live")
             rank = flow_risk.get((src, dst, src_port, dst_port, proto, source), 0)
-            row["risk_level"] = self._rank_level(rank)
+            row["risk_level"] = rank_to_level(rank)
         return rows
+
+    def _query_live_packets_by_ids(self, ids: Sequence[int]) -> list[dict]:
+        normalized_ids = [int(i) for i in ids if int(i) > 0]
+        if not normalized_ids:
+            return []
+        placeholders = ",".join(["?"] * len(normalized_ids))
+        c = self.db.conn.cursor()
+        c.execute(
+            f"""
+            SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, direction, process_id, process_name, source
+            FROM captured_packets
+            WHERE id IN ({placeholders})
+            ORDER BY id DESC
+            """,
+            tuple(normalized_ids),
+        )
+        return [dict(r) for r in c.fetchall()]
 
     def query_packets_by_ids(self, packet_ids: list[int]) -> list[dict]:
         ids = [int(i) for i in packet_ids if int(i) > 0]
@@ -922,43 +900,18 @@ class AppRuntime:
             assert self.offline_packet_store is not None
             rows = self.offline_packet_store.query_packets_by_ids(ids)
             if not rows:
-                placeholders = ",".join(["?"] * len(ids))
-                c = self.db.conn.cursor()
-                c.execute(
-                    f"""
-                    SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, direction, process_id, process_name, source
-                    FROM captured_packets
-                    WHERE id IN ({placeholders})
-                    ORDER BY id DESC
-                    """,
-                    tuple(ids),
-                )
-                rows = [dict(r) for r in c.fetchall()]
+                rows = self._query_live_packets_by_ids(ids)
         else:
-            placeholders = ",".join(["?"] * len(ids))
-            c = self.db.conn.cursor()
-            c.execute(
-                f"""
-                SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, direction, process_id, process_name, source
-                FROM captured_packets
-                WHERE id IN ({placeholders})
-                ORDER BY id DESC
-                """,
-                tuple(ids),
-            )
-            rows = [dict(r) for r in c.fetchall()]
-        for row in rows:
-            row["ts_epoch"] = self._parse_ts_float(row.get("ts", 0.0))
-            row["ts"] = self._render_ts_text(row.get("ts", ""))
-        return rows
+            rows = self._query_live_packets_by_ids(ids)
+        return self._normalize_packet_rows(rows)
 
     def query_packet_detail(self, packet_id: int) -> dict | None:
         details = self.query_packet_details([packet_id], include_related_alerts=True)
         return details.get(int(packet_id))
 
     def _normalize_packet_detail_row(self, packet: dict) -> dict:
-        packet["ts_epoch"] = self._parse_ts_float(packet.get("ts", 0.0))
-        packet["ts"] = self._render_ts_text(packet.get("ts", ""))
+        packet["ts_epoch"] = parse_ts_float(packet.get("ts", 0.0))
+        packet["ts"] = render_ts_text(packet.get("ts", ""))
         return packet
 
     def _query_related_alerts(self, packet: Mapping[str, object], limit: int = 5) -> list[dict]:
@@ -1015,7 +968,7 @@ class AppRuntime:
         if live_ids:
             placeholders = ",".join(["?"] * len(live_ids))
             c = self.db.conn.cursor()
-            c.execute(f"SELECT * FROM captured_packets WHERE id IN ({placeholders})", tuple(live_ids))
+            c.execute(f"SELECT * FROM captured_packets WHERE id IN ({placeholders})", tuple(live_ids))  # nosec
             for row in c.fetchall():
                 packet = self._normalize_packet_detail_row(dict(row))
                 if include_related_alerts:
@@ -1044,8 +997,8 @@ class AppRuntime:
             return {}
         details: dict[int, dict] = {}
         for frame in self.offline_packet_store.query_frame_details(normalized_ids):
-            frame["ts_epoch"] = self._parse_ts_float(frame.get("ts", 0.0))
-            frame["ts"] = self._render_ts_text(frame.get("ts", ""))
+            frame["ts_epoch"] = parse_ts_float(frame.get("ts", 0.0))
+            frame["ts"] = render_ts_text(frame.get("ts", ""))
             frame["related_alerts"] = []
             details[int(frame["id"])] = frame
         return details
@@ -1055,10 +1008,7 @@ class AppRuntime:
         if self._offline_store_enabled() and pid >= int(getattr(OfflinePacketStore, "OFFLINE_ID_BASE", 10_000_000_000)):
             assert self.offline_packet_store is not None
             rows = self.offline_packet_store.query_flow_packets(pid, limit=limit)
-            for row in rows:
-                row["ts_epoch"] = self._parse_ts_float(row.get("ts", 0.0))
-                row["ts"] = self._render_ts_text(row.get("ts", ""))
-            return rows
+            return self._normalize_packet_rows(rows)
 
         c = self.db.conn.cursor()
         c.execute(
@@ -1085,10 +1035,7 @@ class AppRuntime:
             (pid, max(1, int(limit))),
         )
         rows = [dict(r) for r in c.fetchall()]
-        for row in rows:
-            row["ts_epoch"] = self._parse_ts_float(row.get("ts", 0.0))
-            row["ts"] = self._render_ts_text(row.get("ts", ""))
-        return rows
+        return self._normalize_packet_rows(rows)
 
     def analyze_flow(self, packet_id: int, limit: int = 3000, direction_mode: str = "interleaved") -> dict:
         rows = self.query_flow_packets(packet_id=packet_id, limit=limit)
@@ -1399,8 +1346,8 @@ class AppRuntime:
                             except Exception:
                                 packets.append(Raw(raw_bytes))
                                 continue
-                src_ip = str(row.get("src_ip", "") or "0.0.0.0")
-                dst_ip = str(row.get("dst_ip", "") or "0.0.0.0")
+                src_ip = str(row.get("src_ip", "") or "0.0.0.0")  # nosec
+                dst_ip = str(row.get("dst_ip", "") or "0.0.0.0")  # nosec
                 proto = str(row.get("proto", "OTHER")).upper()
                 src_port = int(row.get("src_port", 0) or 0)
                 dst_port = int(row.get("dst_port", 0) or 0)

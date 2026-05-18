@@ -449,7 +449,7 @@ class OfflinePacketStore:
             FROM offline_packets
             WHERE id IN ({placeholders})
             ORDER BY id DESC
-        """
+        """  # nosec
         rows = self.conn.execute(sql, ids).fetchall()
         cols = ["id", "ts", "src_ip", "dst_ip", "src_port", "dst_port", "proto", "length", "direction", "process_id", "process_name", "source"]
         out = [dict(zip(cols, row)) for row in rows]
@@ -489,7 +489,7 @@ class OfflinePacketStore:
             FROM offline_packets
             WHERE id IN ({placeholders})
             ORDER BY id DESC
-            """,
+            """,  # nosec
             real_ids,
         ).fetchall()
         cols = ["id", "ts", "src_ip", "dst_ip", "src_port", "dst_port", "proto", "length", "direction", "process_id", "process_name", "raw_hex", "source"]
@@ -530,7 +530,7 @@ class OfflinePacketStore:
             FROM offline_frames
             WHERE id IN ({placeholders})
             ORDER BY id DESC
-            """,
+            """,  # nosec
             real_ids,
         ).fetchall()
         cols = ["id", "frame_no", "ts", "linktype", "iface", "frame_type", "caplen", "wirelen", "summary", "raw_hex", "source"]

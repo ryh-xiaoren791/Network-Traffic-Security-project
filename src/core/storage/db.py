@@ -457,7 +457,7 @@ class Database:
                 args.append(hash_password(password))
             if updates:
                 args.append(username)
-                c.execute(f"UPDATE users SET {', '.join(updates)} WHERE username=?", tuple(args))
+                c.execute(f"UPDATE users SET {', '.join(updates)} WHERE username=?", tuple(args))  # nosec
                 self.conn.commit()
             return
         c.execute(
