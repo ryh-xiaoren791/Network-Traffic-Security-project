@@ -1247,6 +1247,10 @@ class DesktopApp:
         if not user:
             messagebox.showerror("ERR_AUTH", "Invalid credentials.")
             return
+        if user.must_change and not self._prompt_must_change_password(user.username):
+            # 默认初始密码必须改密后才能进入主界面；放弃则留在登录页
+            self.login_pass_var.set("")
+            return
         self.is_authenticated = True
         self.user_role = user.role
         self.username = user.username
@@ -1256,6 +1260,69 @@ class DesktopApp:
         self._refresh_environment_summary()
         self._route_to("realtime")
         self._animate_transition(self._show_main)
+
+    def _prompt_must_change_password(self, username: str) -> bool:
+        """首次登录强制改密。返回 True=改密成功可进入主界面；False=放弃留在登录页。"""
+        dlg = tk.Toplevel(self.root)
+        self._prepare_detail_dialog(dlg, "[SEC] 首次登录强制改密", "480x340", 440, 300)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # 不允许直接关闭，只能改密或退出登录
+
+        ttk.Label(
+            dlg,
+            text=f"账号「{username}」正在使用默认初始密码，为安全起见必须设置新密码后才能继续使用。",
+            style="Hint.TLabel",
+            wraplength=420,
+        ).pack(fill=tk.X, padx=20, pady=(18, 4), anchor=tk.W)
+
+        result = {"ok": False}
+        old_var = tk.StringVar()
+        new_var = tk.StringVar()
+        confirm_var = tk.StringVar()
+
+        def labeled_row(text: str, variable: tk.StringVar) -> None:
+            row = ttk.Frame(dlg)
+            row.pack(fill=tk.X, padx=20, pady=(0, 8))
+            self._pack_labeled_entry(
+                row, text, variable, show="*", label_width=11,
+                entry_padx=(8, 0), fill=tk.X, expand=True,
+            )
+
+        labeled_row("[KEY] 当前密码", old_var)
+        labeled_row("[KEY] 新密码", new_var)
+        labeled_row("[KEY] 确认新密码", confirm_var)
+        ttk.Label(
+            dlg, text="新密码至少 6 位，且不能与初始密码相同。", style="Path.TLabel"
+        ).pack(fill=tk.X, padx=20, anchor=tk.W)
+
+        def submit(_event=None) -> None:
+            old_pw = old_var.get()
+            new_pw = new_var.get()
+            if not old_pw or not new_pw:
+                messagebox.showwarning("ERR_INPUT", "请输入当前密码与新密码。", parent=dlg)
+                return
+            if new_pw != confirm_var.get():
+                messagebox.showwarning("ERR_INPUT", "两次输入的新密码不一致。", parent=dlg)
+                return
+            if len(new_pw) < 6:
+                messagebox.showwarning("ERR_INPUT", "新密码至少需要 6 位。", parent=dlg)
+                return
+            if not self.auth.change_password(username, old_pw, new_pw):
+                messagebox.showerror("ERR_AUTH", "当前密码不正确，请重试。", parent=dlg)
+                return
+            result["ok"] = True
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.pack(fill=tk.X, padx=20, pady=(14, 16))
+        ttk.Button(btns, text="退出登录", command=dlg.destroy).pack(side=tk.RIGHT)
+        ttk.Button(
+            btns, text="[EXEC] 确认修改", style="Primary.TButton", command=submit
+        ).pack(side=tk.RIGHT, padx=(0, 12))
+        dlg.bind("<Return>", submit)
+        dlg.wait_window()
+        return result["ok"]
 
     def logout(self) -> None:
         self.is_authenticated = False

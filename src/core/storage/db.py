@@ -71,7 +71,8 @@ class Database:
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL DEFAULT '',
                 role TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1
+                enabled INTEGER NOT NULL DEFAULT 1,
+                must_change INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -171,6 +172,7 @@ class Database:
             """
         )
         self._ensure_column("users", "password", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("users", "must_change", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("alerts", "process_name", "TEXT DEFAULT ''")
         self._ensure_column("alerts", "process_id", "INTEGER DEFAULT 0")
         self._ensure_column("alerts", "attack_type", "TEXT DEFAULT ''")
@@ -185,11 +187,13 @@ class Database:
 
     def _ensure_column(self, table: str, column: str, ddl: str) -> None:
         c = self.conn.cursor()
-        c.execute(f"PRAGMA table_info({table})")
+        # 安全：table 为内部常量（非用户输入），无注入面
+        c.execute(f"PRAGMA table_info({table})")  # nosec
         cols = {r["name"] for r in c.fetchall()}
         if column in cols:
             return
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        # 安全：table/column/ddl 均为内部常量（非用户输入），无注入面
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")  # nosec
 
     def _ensure_indexes(self) -> None:
         c = self.conn.cursor()
@@ -455,13 +459,16 @@ class Database:
             if not stored_password:
                 updates.append("password=?")
                 args.append(hash_password(password))
+                # 用默认初始密码补建账号 → 标记首次登录必须改密
+                updates.append("must_change=1")
             if updates:
                 args.append(username)
                 c.execute(f"UPDATE users SET {', '.join(updates)} WHERE username=?", tuple(args))  # nosec
                 self.conn.commit()
             return
+        # 新账号一律用默认初始密码创建 → 强制首次登录改密
         c.execute(
-            "INSERT INTO users(username, password, role, enabled) VALUES(?,?,?,1)",
+            "INSERT INTO users(username, password, role, enabled, must_change) VALUES(?,?,?,1,1)",
             (username, hash_password(password), role),
         )
         self.conn.commit()

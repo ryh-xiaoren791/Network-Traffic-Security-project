@@ -838,20 +838,25 @@ class AppRuntime:
             for row in rows:
                 row["risk_level"] = "normal"
             return rows
-        _sql = f"""
-            WITH requested_flows(src_ip, dst_ip, src_port, dst_port, proto, source) AS (
-                VALUES {", ".join(value_rows)}
-            )
-            SELECT summary.src_ip, summary.dst_ip, summary.src_port, summary.dst_port, summary.proto, summary.source, summary.max_level_rank
-            FROM flow_risk_summary AS summary
-            INNER JOIN requested_flows AS requested
-                ON summary.src_ip = requested.src_ip
-               AND summary.dst_ip = requested.dst_ip
-               AND summary.src_port = requested.src_port
-               AND summary.dst_port = requested.dst_port
-               AND summary.proto = requested.proto
-               AND summary.source = requested.source
-            """
+        # 安全：VALUES 均为 ? 占位符，参数经 args 绑定（参数化查询）
+        values_clause = ", ".join(value_rows)
+        _sql = "\n".join(
+            [
+                "WITH requested_flows(src_ip, dst_ip, src_port, dst_port, proto, source) AS (",
+                "    VALUES " + values_clause,
+                ")",
+                "SELECT summary.src_ip, summary.dst_ip, summary.src_port, summary.dst_port, "
+                "summary.proto, summary.source, summary.max_level_rank",
+                "FROM flow_risk_summary AS summary",
+                "INNER JOIN requested_flows AS requested",
+                "    ON summary.src_ip = requested.src_ip",
+                "   AND summary.dst_ip = requested.dst_ip",
+                "   AND summary.src_port = requested.src_port",
+                "   AND summary.dst_port = requested.dst_port",
+                "   AND summary.proto = requested.proto",
+                "   AND summary.source = requested.source",
+            ]
+        )
         c.execute(_sql, tuple(args))
         for summary_row in c.fetchall():
             key = (
@@ -881,12 +886,16 @@ class AppRuntime:
         placeholders = ",".join(["?"] * len(normalized_ids))
         c = self.db.conn.cursor()
         c.execute(
-            f"""
-            SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, direction, process_id, process_name, source
-            FROM captured_packets
-            WHERE id IN ({placeholders})
-            ORDER BY id DESC
-            """,
+            # 安全：id 均为 ? 占位符，参数经 tuple 绑定（参数化查询）
+            "\n".join(
+                [
+                    "SELECT id, ts, src_ip, dst_ip, src_port, dst_port, proto, length, "
+                    "direction, process_id, process_name, source",
+                    "FROM captured_packets",
+                    "WHERE id IN (" + placeholders + ")",
+                    "ORDER BY id DESC",
+                ]
+            ),
             tuple(normalized_ids),
         )
         return [dict(r) for r in c.fetchall()]

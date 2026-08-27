@@ -33,6 +33,8 @@ python -m pytest tests/ -q
 | 管理员 | `admin` | `Admin@123456` |
 | 只读用户 | `user` | `User@123456` |
 
+> 初始密码仅用于首次登录：系统会强制要求修改密码，设置新密码后才可进入主界面。
+
 ## 功能概览
 
 ### 实时流量监测
@@ -177,3 +179,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build_exe.ps1
 
 - 系统自动清理 30 天前日志（alerts / audit_logs / traffic_stats）
 - 管理员可在桌面版"审计日志"页执行删除与批量删除
+
+## License
+
+[MIT](LICENSE) © 2026 xiaoren

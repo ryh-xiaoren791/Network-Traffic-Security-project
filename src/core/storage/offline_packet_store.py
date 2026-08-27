@@ -14,7 +14,8 @@ class OfflinePacketStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = duckdb.connect(str(self.db_path))
-        self.conn.execute(f"PRAGMA threads={max(1, int(os.cpu_count() or 1))};")
+        # 安全：值为 CPU 数（非用户输入），无注入面
+        self.conn.execute(f"PRAGMA threads={max(1, int(os.cpu_count() or 1))};")  # nosec
         self.conn.execute("PRAGMA memory_limit='3072MB';")
         self._in_bulk = False
         self._index_suspended = False
