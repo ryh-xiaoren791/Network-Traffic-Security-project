@@ -6,7 +6,6 @@ __pycache__/
 .pytest_cache/
 .env
 .env.*
-tests/
 test_results/
 docs/
 dist/
@@ -23,5 +22,3 @@ ppt/
 data/system.db
 .coverage
 .coveragerc
-pytest.ini
-requirements-test.txt
