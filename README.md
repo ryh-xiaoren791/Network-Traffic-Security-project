@@ -123,8 +123,8 @@ src/
 
 ## 测试体系
 
-- 17 个测试文件，173 条用例（单元 ~119 + 集成 ~38 + 安全 22 + 性能 11 + CTF ~35）
-- pytest.ini 定义 9 种标记：`unit` / `integration` / `api` / `performance` / `security` / `slow` / `ctf` / `detection` / `capture` / `offline`
+- 21 个测试文件，187 条用例；带分层标记：`integration` 9、`security` 5、`performance` 8、`api` 1，其余为默认（未标记）用例
+- pytest.ini 定义分层标记：`unit` / `integration` / `api` / `performance` / `security` / `slow` / `ctf` / `detection` / `capture` / `offline`
 - conftest.py 提供共享 fixtures：`tmp_db`、`sample_packet`、`mock_runtime` 等
 - 覆盖率目标 ≥50%（当前 ~51.8%），质量门禁：单元覆盖 ≥60%、集成通过率 ≥95%、高危漏洞 = 0
 
