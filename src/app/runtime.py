@@ -86,11 +86,13 @@ class AppRuntime:
         self.flow_workbench = resolved.flow_workbench or FlowWorkbenchService()
         self.packet_batch_export = resolved.packet_batch_export or PacketBatchExportService()
         self.offline_packet_store: OfflinePacketStore | None = resolved.offline_packet_store
+        self.offline_packet_store_error = ""
         if self.offline_packet_store is None and bool(getattr(CONFIG, "offline_use_duckdb", True)):
             try:
                 self.offline_packet_store = OfflinePacketStore(Path(getattr(CONFIG, "offline_duckdb_path", Path("data/offline_packets.duckdb"))))
-            except Exception:
+            except Exception as exc:
                 self.offline_packet_store = None
+                self.offline_packet_store_error = f"{type(exc).__name__}: {exc}"
         self.report_service = resolved.report_service or ReportService(self.db, offline_packet_store=self.offline_packet_store)
         self.packet_queue: queue.Queue = queue.Queue(maxsize=10000)
         self.capture = resolved.capture or CaptureEngine(self.packet_queue)
@@ -766,6 +768,7 @@ class AppRuntime:
         page_size: int = 500,
         search_text: str = "",
         linktype: int = 0,
+        rule_expr: str = "",
     ) -> dict:
         return packet_query_offline_frames_page(
             self,
@@ -773,6 +776,7 @@ class AppRuntime:
             page_size=page_size,
             search_text=search_text,
             linktype=linktype,
+            rule_expr=rule_expr,
         )
 
     def query_packets(self, limit: int | None = None, process_name: str = "", ip: str = "", source: str = "", rule_expr: str = "") -> list[dict]:
@@ -1334,7 +1338,10 @@ class AppRuntime:
                     writer.writerow({k: row.get(k, "") for k in fields})
             return output_path
         if fmt == "pcap":
-            from scapy.all import Ether, ICMP, IP, Raw, TCP, UDP, wrpcap
+            from scapy.layers.inet import ICMP, IP, TCP, UDP
+            from scapy.layers.l2 import Ether
+            from scapy.packet import Raw
+            from scapy.utils import wrpcap
 
             packets = []
             for row in rows:
@@ -1412,6 +1419,20 @@ class AppRuntime:
 
     def export_packet_candidates(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
         return self.packet_batch_export.export_candidate_rows(rows, output_path, file_format)
+
+    def extract_packet_http_interactions(self, rows: Sequence[dict], detail_batch_size: int = 400) -> list[dict]:
+        return self.packet_batch_export.extract_http_interaction_rows(
+            self.expand_packet_rows(rows, detail_batch_size=detail_batch_size)
+        )
+
+    def export_packet_http_interactions(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
+        return self.packet_batch_export.export_http_interaction_rows(rows, output_path, file_format)
+
+    def extract_packet_http_variants(self, rows: Sequence[dict], detail_batch_size: int = 400) -> list[dict]:
+        return self.packet_batch_export.extract_http_variant_rows(self.expand_packet_rows(rows, detail_batch_size=detail_batch_size))
+
+    def export_packet_http_variants(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
+        return self.packet_batch_export.export_http_variant_rows(rows, output_path, file_format)
 
     def export_packet_flow_body_bundle(self, rows: Sequence[dict], output_dir: Path, detail_batch_size: int = 400) -> Path:
         return self.packet_batch_export.export_flow_body_bundle(

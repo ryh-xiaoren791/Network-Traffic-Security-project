@@ -173,7 +173,8 @@ class CaptureEngine:
         if not isinstance(pkt_bytes, (bytes, bytearray)) or not pkt_bytes:
             return "OTHER", 0, 0, "", ""
         try:
-            from scapy.all import ICMP, IP, IPv6, TCP, UDP
+            from scapy.layers.inet import ICMP, IP, TCP, UDP
+            from scapy.layers.inet6 import IPv6
         except Exception:
             return "OTHER", 0, 0, "", ""
         src_ip = ""

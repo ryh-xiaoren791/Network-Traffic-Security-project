@@ -1,3 +1,5 @@
+import atexit
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
@@ -236,7 +238,7 @@ class DesktopApp:
         content = ttk.Frame(box, style="TFrame")
         content.pack(fill=tk.BOTH, expand=True, padx=32, pady=(32, 24))
         
-        ttk.Label(content, text="AI_TRAFFIC_MONITOR", style="Title.TLabel", anchor=tk.CENTER).pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(content, text="NetScope", style="Title.TLabel", anchor=tk.CENTER).pack(fill=tk.X, pady=(0, 6))
         ttk.Label(content, text="统一身份认证", style="Hint.TLabel", anchor=tk.CENTER).pack(fill=tk.X, pady=(0, 24))
 
         self.login_user_var = tk.StringVar()
@@ -1809,6 +1811,7 @@ class DesktopApp:
             page=page,
             page_size=self._packet_page_size(),
             search_text=self._offline_frame_search_text(process_name, ip),
+            rule_expr=expr,
         )
         result["frame_rows"] = list(frame_result.get("rows", []))
         result["frame_total"] = int(frame_result.get("total", 0) or 0)
@@ -2936,7 +2939,12 @@ class DesktopApp:
         hint_var = tk.StringVar(value="将对完整筛选命中集执行批量导出，适合做题和取证。")
         for label, variable, values, pady in (
             ("导出范围", scope_var, ["当前选中", "当前页", "当前筛选全部"], (18, 4)),
-            ("操作类型", action_var, ["原始流量导出", "字段提取导出", "按流重组导出", "候选字符串导出", "按流正文文件导出"], (12, 4)),
+            (
+                "操作类型",
+                action_var,
+                ["原始流量导出", "字段提取导出", "按流重组导出", "HTTP交互对导出", "参数变化重建导出", "候选字符串导出", "按流正文文件导出"],
+                (12, 4),
+            ),
         ):
             ttk.Label(dlg, text=label, style="Hint.TLabel").pack(anchor=tk.W, padx=18, pady=pady)
             ttk.Combobox(dlg, textvariable=variable, values=values, state="readonly", width=24).pack(anchor=tk.W, padx=18)
@@ -3426,13 +3434,76 @@ class DesktopApp:
         self.root.mainloop()
 
     def _on_close(self) -> None:
-        self.runtime.close()
-        self.root.destroy()
+        try:
+            self.runtime.close()
+        except Exception:
+            pass
+        self._cleanup_organize_dirs()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        self._remove_pyinstaller_tempdir()
+
+    @staticmethod
+    def _cleanup_organize_dirs() -> None:
+        cwd = Path.cwd()
+        file_candidates = [cwd / "duckdb.log"]
+        dir_candidates = [cwd / "log", cwd / "duckdb"]
+        for p in file_candidates:
+            try:
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for p in dir_candidates:
+            try:
+                if not p.is_dir():
+                    continue
+                next(p.iterdir())
+            except StopIteration:
+                try:
+                    p.rmdir()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    @staticmethod
+    def _remove_pyinstaller_tempdir() -> None:
+        if not hasattr(sys, '_MEIPASS') or not sys._MEIPASS:
+            return
+        meipass = str(sys._MEIPASS)
+        try:
+            import subprocess
+            script = (
+                "@echo off\n"
+                "timeout /t 4 /nobreak >nul\n"
+                ":retry\n"
+                f"rmdir /s /q \"{meipass}\" 2>nul\n"
+                f"if exist \"{meipass}\" (\n"
+                "  timeout /t 1 /nobreak >nul\n"
+                "  goto retry\n"
+                ")\n"
+            )
+            subprocess.Popen(
+                ['cmd.exe', '/c', script],
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0x08000000,
+                close_fds=True,
+            )
+        except Exception:
+            pass
 
 
 def main() -> None:
     app = DesktopApp()
-    app.run()
+    atexit.register(DesktopApp._remove_pyinstaller_tempdir)
+    atexit.register(DesktopApp._cleanup_organize_dirs)
+    try:
+        app.run()
+    finally:
+        DesktopApp._remove_pyinstaller_tempdir()
+        DesktopApp._cleanup_organize_dirs()
 
 
 if __name__ == "__main__":

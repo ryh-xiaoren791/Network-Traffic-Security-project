@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import base64
-from collections import defaultdict
+from collections import Counter, defaultdict
 import csv
 import json
 import re
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .service import FlowWorkbenchService
 
@@ -199,6 +199,213 @@ class PacketBatchExportService:
                     }
                 )
         return rows
+
+    def extract_http_interaction_rows(self, packet_details: list[dict]) -> list[dict]:
+        rows: list[dict] = []
+        for flow_index, (flow_meta, flow_rows, analysis) in enumerate(self._build_flow_analyses(packet_details), start=1):
+            client_payload = bytes(analysis.get("client_to_server", {}).get("payload_bytes", b""))
+            server_payload = bytes(analysis.get("server_to_client", {}).get("payload_bytes", b""))
+            requests, responses = self._resolve_http_messages(client_payload, server_payload)
+            pair_count = max(len(requests), len(responses))
+            for index in range(pair_count):
+                req = requests[index] if index < len(requests) else {}
+                resp = responses[index] if index < len(responses) else {}
+                uri = str(req.get("uri", "") or "")
+                uri_decoded = self._safe_url_decode(uri)
+                query = str(req.get("query", "") or "")
+                query_decoded = self._safe_url_decode(query)
+                response_preview = self._preview_text(str(resp.get("body_text", "") or ""))
+                response_hint = self._classify_response_hint(str(resp.get("body_text", "") or ""))
+                rows.append(
+                    {
+                        "flow_index": flow_index,
+                        "source": flow_meta["source"],
+                        "proto": flow_meta["proto"],
+                        "endpoint_a": flow_meta["endpoint_a"],
+                        "endpoint_b": flow_meta["endpoint_b"],
+                        "request_index": index + 1,
+                        "packet_count": len(flow_rows),
+                        "method": str(req.get("method", "") or ""),
+                        "request_uri": uri,
+                        "request_uri_decoded": uri_decoded,
+                        "request_path": str(req.get("path", "") or ""),
+                        "request_query": query,
+                        "request_query_decoded": query_decoded,
+                        "request_host": str(req.get("host", "") or ""),
+                        "request_user_agent": str(req.get("user_agent", "") or ""),
+                        "request_line": str(req.get("line", "") or ""),
+                        "response_status": int(resp.get("status", 0) or 0),
+                        "response_reason": str(resp.get("reason", "") or ""),
+                        "response_body_length": int(resp.get("body_length", 0) or 0),
+                        "response_preview": response_preview,
+                        "response_hint": response_hint,
+                        "response_contains_you": "you are in" in str(resp.get("body_text", "") or "").lower(),
+                        "response_signature": f"{int(resp.get('status', 0) or 0)}|{int(resp.get('body_length', 0) or 0)}|{response_hint}",
+                    }
+                )
+        return rows
+
+    def export_http_interaction_rows(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
+        fmt = str(file_format or "").strip().lower()
+        if fmt == "json":
+            output_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+            return output_path
+        if fmt == "csv":
+            fields = [
+                "flow_index",
+                "source",
+                "proto",
+                "endpoint_a",
+                "endpoint_b",
+                "request_index",
+                "packet_count",
+                "method",
+                "request_uri",
+                "request_uri_decoded",
+                "request_path",
+                "request_query",
+                "request_query_decoded",
+                "request_host",
+                "request_user_agent",
+                "request_line",
+                "response_status",
+                "response_reason",
+                "response_body_length",
+                "response_hint",
+                "response_contains_you",
+                "response_signature",
+                "response_preview",
+            ]
+            with output_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") for key in fields})
+            return output_path
+        lines: list[str] = []
+        for row in rows:
+            lines.extend(
+                [
+                    f"[FLOW {row.get('flow_index', 0)} #{row.get('request_index', 0)}] {row.get('method', '')} {row.get('request_uri', '')}",
+                    f"- endpoint: {row.get('endpoint_a', '')} <-> {row.get('endpoint_b', '')} source={row.get('source', '')}",
+                    f"- status: {row.get('response_status', 0)} {row.get('response_reason', '')} | body_len={row.get('response_body_length', 0)} | hint={row.get('response_hint', '')}",
+                    f"- host: {row.get('request_host', '')} | ua: {row.get('request_user_agent', '')}",
+                    f"- response: {row.get('response_preview', '')}",
+                    "",
+                ]
+            )
+        output_path.write_text("\n".join(lines).rstrip(), encoding="utf-8")
+        return output_path
+
+    def extract_http_variant_rows(self, packet_details: list[dict]) -> list[dict]:
+        interactions = self.extract_http_interaction_rows(packet_details)
+        rows: list[dict] = []
+        for interaction in interactions:
+            query_text = str(interaction.get("request_query_decoded", "") or "")
+            if not query_text:
+                continue
+            params = parse_qsl(query_text, keep_blank_values=True)
+            if not params:
+                continue
+            for key, value in params:
+                blind = self._extract_blind_ascii_hint(str(value or ""))
+                row = {
+                    "row_type": "item",
+                    "flow_index": interaction.get("flow_index", 0),
+                    "request_index": interaction.get("request_index", 0),
+                    "method": interaction.get("method", ""),
+                    "request_path": interaction.get("request_path", ""),
+                    "param_key": str(key or ""),
+                    "param_value": str(value or ""),
+                    "param_value_decoded": self._safe_url_decode(str(value or "")),
+                    "response_status": interaction.get("response_status", 0),
+                    "response_body_length": interaction.get("response_body_length", 0),
+                    "response_hint": interaction.get("response_hint", ""),
+                    "response_signature": interaction.get("response_signature", ""),
+                    "is_success_signal": False,
+                    "blind_position": blind.get("position", 0),
+                    "blind_ascii": blind.get("ascii", 0),
+                    "blind_char": blind.get("char", ""),
+                }
+                rows.append(row)
+        self._mark_variant_success_signals(rows)
+        success_samples = [
+            row
+            for row in rows
+            if bool(row.get("is_success_signal", False))
+            and int(row.get("blind_position", 0) or 0) > 0
+            and int(row.get("blind_ascii", 0) or 0) > 0
+        ]
+        reconstructed = self._reconstruct_blind_text(success_samples)
+        if reconstructed:
+            rows.append(
+                {
+                    "row_type": "summary",
+                    "flow_index": 0,
+                    "request_index": 0,
+                    "method": "",
+                    "request_path": "",
+                    "param_key": "reconstructed_text",
+                    "param_value": reconstructed,
+                    "param_value_decoded": reconstructed,
+                    "response_status": 0,
+                    "response_body_length": 0,
+                    "response_hint": "summary",
+                    "response_signature": "",
+                    "is_success_signal": True,
+                    "blind_position": 0,
+                    "blind_ascii": 0,
+                    "blind_char": reconstructed,
+                }
+            )
+        return rows
+
+    def export_http_variant_rows(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
+        fmt = str(file_format or "").strip().lower()
+        if fmt == "json":
+            output_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+            return output_path
+        if fmt == "csv":
+            fields = [
+                "row_type",
+                "flow_index",
+                "request_index",
+                "method",
+                "request_path",
+                "param_key",
+                "param_value",
+                "param_value_decoded",
+                "response_status",
+                "response_body_length",
+                "response_hint",
+                "response_signature",
+                "is_success_signal",
+                "blind_position",
+                "blind_ascii",
+                "blind_char",
+            ]
+            with output_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({key: row.get(key, "") for key in fields})
+            return output_path
+        lines: list[str] = []
+        for row in rows:
+            if str(row.get("row_type", "")) == "summary":
+                lines.extend(
+                    [
+                        "[Reconstructed]",
+                        f"- text: {row.get('param_value', '')}",
+                        "",
+                    ]
+                )
+                continue
+            lines.append(
+                f"[#{row.get('request_index', 0)}] {row.get('method', '')} {row.get('request_path', '')} | {row.get('param_key', '')}={row.get('param_value', '')} | status={row.get('response_status', 0)} len={row.get('response_body_length', 0)} signal={int(bool(row.get('is_success_signal', False)))} pos={row.get('blind_position', 0)} ascii={row.get('blind_ascii', 0)} char={row.get('blind_char', '')}"
+            )
+        output_path.write_text("\n".join(lines).rstrip(), encoding="utf-8")
+        return output_path
 
     def export_candidate_rows(self, rows: list[dict], output_path: Path, file_format: str) -> Path:
         fmt = str(file_format or "").strip().lower()
@@ -486,3 +693,192 @@ class PacketBatchExportService:
     @staticmethod
     def _safe_name(text: str) -> str:
         return re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip("_") or "flow")
+
+    def _extract_http_requests(self, payload: bytes) -> list[dict]:
+        rows: list[dict] = []
+        for message in self._extract_http_messages(payload, request=True):
+            line = str(message.get("line", "") or "")
+            match = re.match(r"^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)(?:\s+HTTP/1\.[01])?", line)
+            if not match:
+                continue
+            uri = str(match.group(2) or "")
+            parsed = urlsplit(uri)
+            headers = dict(message.get("headers", {}))
+            rows.append(
+                {
+                    "line": line,
+                    "method": str(match.group(1) or ""),
+                    "uri": uri,
+                    "path": str(parsed.path or ""),
+                    "query": str(parsed.query or ""),
+                    "host": str(headers.get("host", "") or ""),
+                    "user_agent": str(headers.get("user-agent", "") or ""),
+                }
+            )
+        return rows
+
+    def _extract_http_responses(self, payload: bytes) -> list[dict]:
+        rows: list[dict] = []
+        for message in self._extract_http_messages(payload, request=False):
+            line = str(message.get("line", "") or "")
+            match = re.match(r"^HTTP/1\.[01]\s+(\d{3})(?:\s+(.+))?$", line)
+            if not match:
+                continue
+            body = bytes(message.get("body", b"") or b"")
+            headers = dict(message.get("headers", {}))
+            try:
+                content_length = int(headers.get("content-length", "0") or 0)
+            except Exception:
+                content_length = 0
+            total_length = max(len(body), content_length)
+            body_text = self._decode_bytes_lossy(body)
+            rows.append(
+                {
+                    "line": line,
+                    "status": int(match.group(1) or 0),
+                    "reason": str(match.group(2) or "").strip(),
+                    "body_length": int(total_length),
+                    "body_text": body_text,
+                }
+            )
+        return rows
+
+    def _resolve_http_messages(self, client_payload: bytes, server_payload: bytes) -> tuple[list[dict], list[dict]]:
+        client_requests = self._extract_http_requests(client_payload)
+        client_responses = self._extract_http_responses(client_payload)
+        server_requests = self._extract_http_requests(server_payload)
+        server_responses = self._extract_http_responses(server_payload)
+        normal_score = len(client_requests) + len(server_responses)
+        reversed_score = len(server_requests) + len(client_responses)
+        if reversed_score > normal_score:
+            return server_requests, client_responses
+        return client_requests, server_responses
+
+    def _extract_http_messages(self, payload: bytes, *, request: bool) -> list[dict]:
+        if not payload:
+            return []
+        start_re = re.compile(rb"(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+\S+(?:\s+HTTP/1\.[01])?" if request else rb"HTTP/1\.[01]\s+\d{3}[^\r\n]*")
+        matches = list(start_re.finditer(payload))
+        out: list[dict] = []
+        for index, matched in enumerate(matches):
+            start = matched.start()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(payload)
+            chunk = payload[start:end]
+            header_end = chunk.find(b"\r\n\r\n")
+            sep_len = 4
+            if header_end < 0:
+                header_end = chunk.find(b"\n\n")
+                sep_len = 2
+            if header_end < 0:
+                header = chunk
+                body = b""
+            else:
+                header = chunk[:header_end]
+                body = chunk[header_end + sep_len :]
+            header_text = self._decode_bytes_lossy(header)
+            lines = [line.strip() for line in re.split(r"\r?\n", header_text) if line.strip()]
+            if not lines:
+                continue
+            line = lines[0]
+            headers: dict[str, str] = {}
+            for line_text in lines[1:]:
+                if ":" not in line_text:
+                    continue
+                key, value = line_text.split(":", 1)
+                headers[str(key or "").strip().lower()] = str(value or "").strip()
+            try:
+                content_length = int(headers.get("content-length", "0") or 0)
+            except Exception:
+                content_length = 0
+            if content_length > 0 and len(body) >= content_length:
+                body = body[:content_length]
+            out.append({"line": line, "headers": headers, "body": body, "content_length": content_length})
+        return out
+
+    @staticmethod
+    def _decode_bytes_lossy(blob: bytes) -> str:
+        if not blob:
+            return ""
+        return blob.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _safe_url_decode(text: str) -> str:
+        try:
+            return unquote(str(text or ""))
+        except Exception:
+            return str(text or "")
+
+    def _classify_response_hint(self, body_text: str) -> str:
+        text = str(body_text or "").lower()
+        if not text:
+            return "empty"
+        positive_keywords = ("you are in", "welcome", "success", "logged in")
+        negative_keywords = ("error", "warning", "failed", "forbidden", "denied", "not found")
+        if any(keyword in text for keyword in positive_keywords):
+            return "positive"
+        if any(keyword in text for keyword in negative_keywords):
+            return "negative"
+        return "neutral"
+
+    def _is_success_signal(self, interaction: dict) -> bool:
+        status = int(interaction.get("response_status", 0) or 0)
+        body_length = int(interaction.get("response_body_length", 0) or 0)
+        hint = str(interaction.get("response_hint", "") or "").lower()
+        if hint == "positive":
+            return True
+        if body_length > 0 and body_length >= 900:
+            return True
+        if hint == "neutral" and status in {200, 201, 202, 203}:
+            return True
+        return False
+
+    def _extract_blind_ascii_hint(self, text: str) -> dict[str, object]:
+        content = self._safe_url_decode(str(text or "")).lower()
+        pattern = re.compile(r"ascii\s*\(\s*substr\s*\(.+?,\s*(\d+)\s*,\s*1\)\s*\)\s*=\s*(\d+)")
+        matched = pattern.search(content)
+        if not matched:
+            return {"position": 0, "ascii": 0, "char": ""}
+        position = int(matched.group(1) or 0)
+        ascii_code = int(matched.group(2) or 0)
+        char = chr(ascii_code) if 0 < ascii_code < 128 else ""
+        return {"position": position, "ascii": ascii_code, "char": char}
+
+    def _reconstruct_blind_text(self, rows: list[dict]) -> str:
+        by_position: dict[int, Counter[int]] = defaultdict(Counter)
+        for row in rows:
+            position = int(row.get("blind_position", 0) or 0)
+            ascii_code = int(row.get("blind_ascii", 0) or 0)
+            if position <= 0 or ascii_code <= 0:
+                continue
+            by_position[position][ascii_code] += 1
+        if not by_position:
+            return ""
+        chars: list[str] = []
+        for position in sorted(by_position):
+            ranking = by_position[position].most_common(2)
+            if not ranking:
+                continue
+            if len(ranking) > 1 and ranking[0][1] <= ranking[1][1]:
+                # 同位存在并列候选，说明当前位无法稳定判定，停止拼接避免噪声尾巴。
+                break
+            best_ascii = ranking[0][0]
+            chars.append(chr(best_ascii) if 0 < best_ascii < 128 else "?")
+        return "".join(chars).strip()
+
+    def _mark_variant_success_signals(self, rows: list[dict]) -> None:
+        grouped: dict[tuple[str, str, int], list[dict]] = defaultdict(list)
+        for row in rows:
+            position = int(row.get("blind_position", 0) or 0)
+            if position > 0:
+                grouped[(str(row.get("request_path", "") or ""), str(row.get("param_key", "") or ""), position)].append(row)
+        for group_rows in grouped.values():
+            signature_counter = Counter(str(row.get("response_signature", "") or "") for row in group_rows)
+            if len(signature_counter) >= 2:
+                minority_count = min(signature_counter.values())
+                minority_signatures = {sig for sig, count in signature_counter.items() if count == minority_count}
+                for row in group_rows:
+                    if str(row.get("response_signature", "") or "") in minority_signatures:
+                        row["is_success_signal"] = True
+                continue
+            for row in group_rows:
+                row["is_success_signal"] = self._is_success_signal(row)

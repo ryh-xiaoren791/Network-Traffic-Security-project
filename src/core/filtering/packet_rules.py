@@ -25,6 +25,19 @@ def _lookup_contains_text(row: Mapping[str, object], field: str) -> str:
     return str(row.get(field, ""))
 
 
+def _lookup_frame_contains_text(row: Mapping[str, object], field: str) -> str:
+    if field in {"frame", "frame_type", "type"}:
+        return str(row.get("frame_type", ""))
+    if field in {"iface", "interface"}:
+        return str(row.get("iface", ""))
+    if field in {"summary", "raw", "raw_hex", "source"}:
+        key = "raw_hex" if field in {"raw", "raw_hex"} else field
+        return str(row.get(key, ""))
+    if field in {"link", "linktype"}:
+        return str(row.get("linktype", ""))
+    return str(row.get(field, ""))
+
+
 def _flatten_packet_row(row: Mapping[str, object], include_risk_text: bool) -> str:
     fields = [
         str(row.get("src_ip", "")),
@@ -63,6 +76,41 @@ def _extract_compare_values(row: Mapping[str, object], field: str) -> list[objec
         return [str(row.get("process_name", ""))]
     if field in {"proto", "source", "ts", "time"}:
         key = "ts" if field in {"ts", "time"} else field
+        return [row.get(key, "")]
+    return [row.get(field, "")]
+
+
+def _flatten_frame_row(row: Mapping[str, object]) -> str:
+    fields = [
+        str(row.get("frame_no", "")),
+        str(row.get("linktype", "")),
+        str(row.get("iface", "")),
+        str(row.get("frame_type", "")),
+        str(row.get("caplen", "")),
+        str(row.get("wirelen", "")),
+        str(row.get("summary", "")),
+        str(row.get("raw_hex", "")),
+        str(row.get("source", "")),
+    ]
+    return " ".join(fields).lower()
+
+
+def _extract_frame_compare_values(row: Mapping[str, object], field: str) -> list[object]:
+    if field in {"frame.number", "frame_no", "frame", "no", "id"}:
+        key = "frame_no" if field != "id" else "id"
+        return [int(row.get(key, 0) or 0)]
+    if field in {"frame.len", "len", "wirelen"}:
+        return [int(row.get("wirelen", 0) or 0)]
+    if field in {"caplen", "capture.len"}:
+        return [int(row.get("caplen", 0) or 0)]
+    if field in {"link", "linktype"}:
+        return [int(row.get("linktype", 0) or 0)]
+    if field in {"iface", "interface"}:
+        return [str(row.get("iface", ""))]
+    if field in {"frame_type", "type"}:
+        return [str(row.get("frame_type", ""))]
+    if field in {"summary", "raw", "raw_hex", "source", "ts", "time"}:
+        key = "raw_hex" if field in {"raw", "raw_hex"} else field
         return [row.get(key, "")]
     return [row.get(field, "")]
 
@@ -147,6 +195,58 @@ def match_packet_rule(row: Mapping[str, object], expression: str, include_risk_t
                 negate = not negate
                 term = term[1:].strip()
             term_ok = match_packet_term(row, term, include_risk_text=include_risk_text)
+            if negate:
+                term_ok = not term_ok
+            if not term_ok:
+                matched = False
+                break
+        if matched:
+            return True
+    return False
+
+
+def match_frame_term(row: Mapping[str, object], term: str) -> bool:
+    normalized = term.strip().lower()
+    if not normalized:
+        return True
+    contains_match = re.match(r"^([a-zA-Z0-9_.]+)\s+contains\s+(.+)$", normalized)
+    if contains_match:
+        field = str(contains_match.group(1) or "").strip()
+        value = str(contains_match.group(2) or "").strip().strip("'").strip('"')
+        return value.lower() in _lookup_frame_contains_text(row, field).lower()
+    parsed = parse_packet_rule_term(normalized)
+    if not parsed:
+        return normalized in _flatten_frame_row(row)
+    field, op, expected_raw = parsed
+    try:
+        expected_num = float(expected_raw)
+    except Exception:
+        expected_num = None
+    values = _extract_frame_compare_values(row, field)
+    def comparator(value):
+        return _compare_rule_value(value, op, expected_raw, expected_num)
+    if op == "!=":
+        return all(comparator(value) for value in values)
+    return any(comparator(value) for value in values)
+
+
+def match_frame_rule(row: Mapping[str, object], expression: str) -> bool:
+    expr = str(expression or "").strip()
+    if not expr:
+        return True
+    or_parts = [part.strip() for part in expr.split("||") if part.strip()]
+    if not or_parts:
+        return True
+    for or_part in or_parts:
+        and_parts = [part.strip() for part in or_part.split("&&") if part.strip()]
+        matched = True
+        for raw_term in and_parts:
+            term = raw_term
+            negate = False
+            while term.startswith("!"):
+                negate = not negate
+                term = term[1:].strip()
+            term_ok = match_frame_term(row, term)
             if negate:
                 term_ok = not term_ok
             if not term_ok:

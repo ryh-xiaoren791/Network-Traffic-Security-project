@@ -14,12 +14,37 @@ class OfflinePacketStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = duckdb.connect(str(self.db_path))
-        # 安全：值为 CPU 数（非用户输入），无注入面
-        self.conn.execute(f"PRAGMA threads={max(1, int(os.cpu_count() or 1))};")  # nosec
-        self.conn.execute("PRAGMA memory_limit='3072MB';")
+        self._configure_connection()
         self._in_bulk = False
         self._index_suspended = False
         self._init_schema()
+
+    def _configure_connection(self) -> None:
+        self._disable_profiling_output()
+        self._execute_optional("SET enable_progress_bar=false;")
+        self._execute_optional(f"PRAGMA threads={max(1, int(os.cpu_count() or 1))};")
+        self._execute_optional("PRAGMA memory_limit='3072MB';")
+
+    def _disable_profiling_output(self) -> None:
+        # DuckDB 在不同版本中对关闭 profiling 的取值不同。
+        # 这里优先使用新版本支持的 no_output，失败再回退旧值 off，
+        # 避免因为非关键 profiling 配置导致整个离线存储初始化失败。
+        for sql in (
+            "PRAGMA enable_profiling='no_output';",
+            "PRAGMA enable_profiling='off';",
+        ):
+            try:
+                self.conn.execute(sql)
+                return
+            except Exception:
+                continue
+
+    def _execute_optional(self, sql: str) -> None:
+        try:
+            self.conn.execute(sql)
+        except Exception:
+            # 这些运行时调优项不应影响核心功能可用性。
+            pass
 
     def _init_schema(self) -> None:
         self.conn.execute(

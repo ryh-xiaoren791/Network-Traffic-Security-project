@@ -26,7 +26,7 @@ class AppConfig:
     offline_enable_app_meta: bool = False
     offline_enable_detection: bool = False
     offline_balanced_batch_size: int = 4000
-    offline_balanced_raw_hex_preview_bytes: int = 128
+    offline_balanced_raw_hex_preview_bytes: int = 2048
     offline_balanced_store_raw_hex: bool = True
     offline_balanced_store_packets: bool = True
     offline_balanced_enable_app_meta: bool = True
@@ -41,7 +41,7 @@ class AppConfig:
     offline_speed_enable_app_meta: bool = False
     offline_speed_enable_detection: bool = False
     offline_detect_batch_size: int = 3000
-    offline_detect_raw_hex_preview_bytes: int = 256
+    offline_detect_raw_hex_preview_bytes: int = 2048
     offline_detect_store_raw_hex: bool = True
     offline_detect_store_packets: bool = True
     offline_detect_enable_app_meta: bool = True

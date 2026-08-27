@@ -1,7 +1,6 @@
 pydivert==2.1.0
 scapy==2.6.1
 psutil==6.1.1
-win10toast==0.9
 numpy==1.26.4
 scipy==1.13.1
 scikit-learn==1.5.1

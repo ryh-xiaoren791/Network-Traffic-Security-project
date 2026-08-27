@@ -19,6 +19,16 @@ BATCH_EXPORT_ACTION_CONFIG: dict[str, dict[str, object]] = {
         "formats": ["csv", "json", "txt"],
         "hint": "按流重组会把当前结果按五元组归并，输出每条流的双向摘要与预览。",
     },
+    "HTTP交互对导出": {
+        "key": "http_interaction_rows",
+        "formats": ["csv", "json", "txt"],
+        "hint": "HTTP交互对导出会按请求-响应配对输出请求行、参数、响应长度与正文特征，适合分析交互型题目。",
+    },
+    "参数变化重建导出": {
+        "key": "http_variant_rows",
+        "formats": ["csv", "json", "txt"],
+        "hint": "参数变化重建导出会提取请求参数、响应信号与可重建字符线索，适合盲注、枚举和回显差异题。",
+    },
     "候选字符串导出": {
         "key": "candidate_rows",
         "formats": ["csv", "json", "txt"],
@@ -52,6 +62,12 @@ def execute_packet_batch_export(runtime, action_label: str, rows: list[dict], ou
     if action_key == "flow_rows":
         export_rows = runtime.extract_packet_flows(rows)
         return runtime.export_packet_flows(export_rows, output_path, fmt), len(export_rows)
+    if action_key == "http_interaction_rows":
+        export_rows = runtime.extract_packet_http_interactions(rows)
+        return runtime.export_packet_http_interactions(export_rows, output_path, fmt), len(export_rows)
+    if action_key == "http_variant_rows":
+        export_rows = runtime.extract_packet_http_variants(rows)
+        return runtime.export_packet_http_variants(export_rows, output_path, fmt), len(export_rows)
     if action_key == "candidate_rows":
         export_rows = runtime.extract_packet_candidates(rows)
         return runtime.export_packet_candidates(export_rows, output_path, fmt), len(export_rows)

@@ -87,7 +87,7 @@ python -m pytest tests/ -q
 src/
 ├── config.py                   # 全局配置 (AppConfig dataclass)
 ├── subprocess_utils.py         # 子进程调用工具
-├── desktop_main.py             # PySide6 桌面应用入口
+├── desktop_main.py             # tkinter 桌面应用入口
 ├── app/                        # 应用运行时层
 │   ├── runtime.py              # AppRuntime 核心调度引擎
 │   ├── offline_imports.py      # 离线 PCAP 导入编排
@@ -160,7 +160,7 @@ bandit -r src/
 powershell -ExecutionPolicy Bypass -File scripts/build_exe.ps1
 ```
 
-输出：`exe/ai_traffic_guard_desktop.exe`
+输出：`exe/NetScope.exe`
 
 ## 目录说明
 

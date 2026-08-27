@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-from src.core.filtering import match_packet_rule
+from src.core.filtering import match_frame_rule, match_packet_rule
 
 
 def query_packets_page(
@@ -220,26 +220,86 @@ def query_offline_frames_page(
     page_size: int = 500,
     search_text: str = "",
     linktype: int = 0,
+    rule_expr: str = "",
 ) -> dict:
     if not runtime._offline_store_enabled():
         return {"rows": [], "total": 0, "page": 1, "page_size": page_size, "total_pages": 1}
     assert runtime.offline_packet_store is not None
     current_page = max(1, int(page or 1))
     normalized_page_size = max(50, min(2000, int(page_size or 500)))
-    total = runtime.offline_packet_store.count_frames(source="offline", search_text=search_text, linktype=linktype)
-    total_pages = max(1, (total + normalized_page_size - 1) // normalized_page_size) if total > 0 else 1
+    normalized_rule_expr = str(rule_expr or "").strip()
+    if not normalized_rule_expr:
+        total = runtime.offline_packet_store.count_frames(source="offline", search_text=search_text, linktype=linktype)
+        total_pages = max(1, (total + normalized_page_size - 1) // normalized_page_size) if total > 0 else 1
+        current_page = min(current_page, total_pages)
+        offset = (current_page - 1) * normalized_page_size
+        rows = runtime.offline_packet_store.query_frames(
+            limit=normalized_page_size,
+            offset=offset,
+            source="offline",
+            search_text=search_text,
+            linktype=linktype,
+        )
+        return {
+            "rows": runtime._normalize_packet_rows(rows),
+            "total": total,
+            "page": current_page,
+            "page_size": normalized_page_size,
+            "total_pages": total_pages,
+        }
+    chunk_size = min(max(runtime._packet_query_chunk_size, 1000), 5000)
+    matched_total = 0
+    offset = 0
+    target_start = (current_page - 1) * normalized_page_size
+    target_end = target_start + normalized_page_size
+    page_rows: list[dict] = []
+    while True:
+        chunk = runtime.offline_packet_store.query_frames(
+            limit=chunk_size,
+            offset=offset,
+            source="offline",
+            search_text=search_text,
+            linktype=linktype,
+        )
+        if not chunk:
+            break
+        offset += len(chunk)
+        normalized_chunk = runtime._normalize_packet_rows(chunk)
+        for row in normalized_chunk:
+            if not match_frame_rule(row, normalized_rule_expr):
+                continue
+            if target_start <= matched_total < target_end:
+                page_rows.append(row)
+            matched_total += 1
+    total_pages = max(1, (matched_total + normalized_page_size - 1) // normalized_page_size) if matched_total > 0 else 1
     current_page = min(current_page, total_pages)
-    offset = (current_page - 1) * normalized_page_size
-    rows = runtime.offline_packet_store.query_frames(
-        limit=normalized_page_size,
-        offset=offset,
-        source="offline",
-        search_text=search_text,
-        linktype=linktype,
-    )
+    if current_page != page:
+        target_start = (current_page - 1) * normalized_page_size
+        target_end = target_start + normalized_page_size
+        page_rows = []
+        matched_total = 0
+        offset = 0
+        while True:
+            chunk = runtime.offline_packet_store.query_frames(
+                limit=chunk_size,
+                offset=offset,
+                source="offline",
+                search_text=search_text,
+                linktype=linktype,
+            )
+            if not chunk:
+                break
+            offset += len(chunk)
+            normalized_chunk = runtime._normalize_packet_rows(chunk)
+            for row in normalized_chunk:
+                if not match_frame_rule(row, normalized_rule_expr):
+                    continue
+                if target_start <= matched_total < target_end:
+                    page_rows.append(row)
+                matched_total += 1
     return {
-        "rows": runtime._normalize_packet_rows(rows),
-        "total": total,
+        "rows": page_rows,
+        "total": matched_total,
         "page": current_page,
         "page_size": normalized_page_size,
         "total_pages": total_pages,

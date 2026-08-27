@@ -220,7 +220,12 @@ def _iter_native_batches(pcap_path: Path, cfg: OfflineParserConfig) -> Iterator[
 
 def _iter_scapy_batches(pcap_path: Path, cfg: OfflineParserConfig) -> Iterator[OfflineBatch]:
     try:
-        from scapy.all import DNS, DNSRR, ICMP, IP, IPv6, Ether, PcapReader, Raw, TCP, UDP
+        from scapy.layers.dns import DNS, DNSRR
+        from scapy.layers.inet import ICMP, IP, TCP, UDP
+        from scapy.layers.inet6 import IPv6
+        from scapy.layers.l2 import Ether
+        from scapy.packet import Raw
+        from scapy.utils import PcapReader
     except Exception as e:
         raise OfflineParserError(f"离线分析依赖Scapy不可用: {e}") from e
     def build_row(pkt: object, raw_bytes: bytes, ts: float) -> dict[str, object] | None:

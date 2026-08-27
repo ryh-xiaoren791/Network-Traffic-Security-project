@@ -254,7 +254,9 @@ class SessionAggregator:
         if not raw_hex:
             return set(), ""
         try:
-            from scapy.all import IP, IPv6, Raw, TCP
+            from scapy.layers.inet import IP, TCP
+            from scapy.layers.inet6 import IPv6
+            from scapy.packet import Raw
         except Exception:
             return set(), ""
         try:
